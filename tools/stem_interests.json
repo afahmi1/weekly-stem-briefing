@@ -1,0 +1,69 @@
+{
+  "_readme": "EDIT THIS FILE to change what the briefing personalizes for you. 'match' = lowercase substrings looked for in the title/abstract/journal (first/most specific wins). 'weight' = 0-100 personal-appeal score for a hit. Add or delete blocks freely. 'axis_weights' sets how the three 0-100 axes combine into the ranking (must sum to ~1.0).",
+
+  "axis_weights": {
+    "market": 0.30,
+    "field": 0.35,
+    "personal": 0.35
+  },
+
+  "interests": [
+    {
+      "label": "Surgical robotics",
+      "weight": 100,
+      "match": ["da vinci", "surgical robot", "robotic surgery", "minimally invasive surg",
+                "intuitive surgical", "ion bronch", "endoscop", "teleoperat", "haptic"]
+    },
+    {
+      "label": "Prosthetics / biomechanics",
+      "weight": 92,
+      "match": ["prosthe", "grip strength", "grasp", "emg", "electromyograph", "biomechanic",
+                "finger", "hand function", "tendon", "orthosis", "exoskeleton"]
+    },
+    {
+      "label": "3D printing / additive manufacturing",
+      "weight": 86,
+      "match": ["3d print", "additive manufactur", "fused deposition", "fdm",
+                "stereolithograph", "bioprint", "lattice structure"]
+    },
+    {
+      "label": "Neural interfaces / BCI",
+      "weight": 78,
+      "match": ["brain-computer", "brain computer", "neural interface", "neuroprosthe",
+                "bci", "neural implant", "motor cortex"]
+    },
+    {
+      "label": "Medical devices",
+      "weight": 74,
+      "match": ["medical device", "implant", "biomaterial", "tissue engineer", "biosensor",
+                "wearable", "catheter", "fda"]
+    },
+    {
+      "label": "Birds / ornithology",
+      "weight": 68,
+      "match": ["bird", "avian", "ornitholog", "songbird", "vocalisation", "vocalization",
+                "saxicola", "plumage", "migrat"]
+    },
+    {
+      "label": "AI / LLM agents",
+      "weight": 66,
+      "match": ["large language model", "llm", "ai agent", "autonomous agent",
+                "language model", "reinforcement learning", "diagnosis with language"]
+    },
+    {
+      "label": "Robotics / control",
+      "weight": 60,
+      "match": ["robot", "actuator", "soft robot", "control system", "sensor fusion"]
+    },
+    {
+      "label": "Surgery / clinical workflow",
+      "weight": 52,
+      "match": ["surg", "operating room", "clinical workflow", "patient outcome"]
+    },
+    {
+      "label": "Markets / trading",
+      "weight": 46,
+      "match": ["market", "equity", "trading", "financial", "portfolio", "econometr"]
+    }
+  ]
+}
