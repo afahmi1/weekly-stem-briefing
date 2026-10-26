@@ -64,6 +64,31 @@
       "label": "Markets / trading",
       "weight": 46,
       "match": ["market", "equity", "trading", "financial", "portfolio", "econometr"]
+    },
+    {
+      "label": "Focused ultrasound",
+      "weight": 90,
+      "match": ["focused ultrasound", "high-intensity focused", "hifu", "histotripsy",
+                "ultrasound neuromodulation", "acoustic neuromodulation", "sonogenetic",
+                "transcranial ultrasound", "blood-brain barrier opening",
+                "ultrasound ablation", "cavitation-mediated", "mr-guided ultrasound"]
+    },
+    {
+      "label": "Animal communication",
+      "weight": 88,
+      "match": ["animal communication", "bioacoustic", "birdsong", "bird song",
+                "alarm call", "signature whistle", "song learning", "mating call",
+                "echolocation", "pheromone signal", "chemical communication",
+                "cetacean call", "primate call", "vocal repertoire", "ultrasonic vocalization",
+                "multimodal signal", "seismic communication"]
+    },
+    {
+      "label": "Biological computers",
+      "weight": 84,
+      "match": ["biological comput", "biocomput", "dna comput", "molecular comput",
+                "cellular comput", "organoid intelligence", "biocomputer",
+                "living computer", "synthetic biology", "genetic circuit",
+                "neural organoid", "in vitro computing"]
     }
   ]
 }
