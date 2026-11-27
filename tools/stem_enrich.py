@@ -51,8 +51,9 @@ _FIELD_KW = [
                 "macrophage", "cytokine", "inflammasome", "antiviral"]),
     ("Medicine", ["patient", "clinical trial", "cancer", "tumor", "therapy", "disease",
                   "treatment", "diagnos", "carcinoma", "surviv", "cohort", "mortality",
-                  "burden of disease"]),
-    ("Bio", ["cell ", "gene ", "genom", "protein", "rna", "enzyme", "mutation", "evolution",
+                  "burden of disease", "surgery", "surgical", "surgeon", "stenosis",
+                  "spinal", "spine", "orthop", "endoscop", "clinical", "disorder"]),
+    ("Bio", ["mrna", "cell ", "gene ", "genom", "protein", "rna", "enzyme", "mutation", "evolution",
              "species", "organism", "crispr", "transcript", "phylogen", "receptor", "molecular"]),
 ]
 
@@ -82,11 +83,26 @@ def _hay(item: dict) -> str:
     ]).lower()
 
 
+_SHORT_KW = {}
+
+
+def _kw_hit(k: str, hay: str) -> bool:
+    """Substring match, except short keys (rna, llm, gpu, mof) need word bounds:
+    a bare 'rna' hit 'jou-rna-l' and 'inte-rna-tional', dumping every
+    'Journal of ...' paper into Bio."""
+    if len(k.strip()) > 4:
+        return k in hay
+    rx = _SHORT_KW.get(k)
+    if rx is None:
+        rx = _SHORT_KW[k] = re.compile(r"\b" + re.escape(k.strip()) + r"s?\b")
+    return bool(rx.search(hay))
+
+
 def classify_field(item: dict) -> str:
     """Canonical STEM field from journal + title + abstract keywords."""
     hay = _hay(item)
     for field, kws in _FIELD_KW:
-        if any(k in hay for k in kws):
+        if any(_kw_hit(k, hay) for k in kws):
             return field
     raw = (item.get("field") or "").strip().lower()
     if raw in _OA_FIELD_MAP:

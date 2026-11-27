@@ -191,7 +191,8 @@ into `~/.hermes/skills/research/weekly-stem-briefing/` so your agent knows how t
 and explain the briefing, and schedule it:
 
 ```
-cron: 0 6 * * 1   /usr/bin/python3 ~/WeeklyStemBriefing/tools/weekly_stem_briefing.py
+cron: 0 6 * * *   /usr/bin/python3 ~/WeeklyStemBriefing/tools/weekly_stem_briefing.py
+       # daily; the generator itself decides whether the window has closed
 ```
 
 ---

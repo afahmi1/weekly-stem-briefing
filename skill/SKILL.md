@@ -15,18 +15,49 @@ metadata:
 
 A field-balanced, triple-ranked weekly digest of peer-reviewed science, with a free
 full-text link (or sci-hub fallback) for every paper. Feeds a native macOS widget and a
-Monday-morning text.
+morning text on the day each week rolls over.
 
 ## Generator
 
 ```bash
-python3 ~/.hermes/profiles/research/tools/weekly_stem_briefing.py            # last 7 days
+python3 ~/.hermes/profiles/research/tools/weekly_stem_briefing.py            # build the next window
+python3 ~/.hermes/profiles/research/tools/weekly_stem_briefing.py --status   # window state, no network
 python3 ~/.hermes/profiles/research/tools/weekly_stem_briefing.py --dry-run  # print table, no write
 python3 ~/.hermes/profiles/research/tools/weekly_stem_briefing.py --no-fulltext  # fast, no links
 ```
 
 Flags: `--days 7`, `--top 14` (papers kept after balancing), `--headlines 4` (per feed),
-`--pages 2` (OpenAlex pages x200 to scan), `--end YYYY-MM-DD`.
+`--pages 2` (OpenAlex pages x200 to scan), `--end YYYY-MM-DD` (pin the window),
+`--max-age-days 182`, `--force` (rebuild an open window), `--status`.
+
+**The window chains, and that is the whole refresh mechanism.** A run reads `window.end`
+from the briefing already on disk. While today is still on or before that date the window
+is open and the generator prints `WINDOW OPEN ... nothing to do` and exits 0 without
+touching anything. The first run on the day after `end` builds `end -> end + days`, so
+consecutive briefings tile the calendar, the header rolls forward by itself, and nothing
+overlaps except the single boundary day that is both the old end and the new start.
+Catch-up after missed runs is lossless: the earliest outstanding window is built first,
+then the next one on the following run. `--end` pins a window and skips the chain;
+`--force` rebuilds the open window in place; `--dry-run` is allowed through an open window
+because it writes nothing.
+
+```
+window 2026-11-05..2026-11-12 (chained from the previous window)
+WINDOW OPEN: 2026-11-05..2026-11-12 is still current (6 day(s) left, closes end of 2026-11-12). Next refresh 2026-11-13: nothing to do.
+```
+
+`test_window_chain.py` proves the chain without a network (run it after any edit); it
+covers first run, open window, the roll, the second roll, multi-week catch-up, `--force`,
+`--dry-run`, and a pinned `--end`.
+
+
+**Window floor (hard).** Nothing older than `MAX_AGE_DAYS` (182, ~6 months) before `--end`
+is ever queried or kept. `--days` is clamped to it, so a big `--days` cannot reach further
+back. The floor is then re-proved on the returned records (step 1b): any paper whose
+`publication_date` falls outside `[end - max_age, end]` is dropped before it can take a slot,
+because OpenAlex will happily date a work to its issue/reindex date. The floor and the
+effective window are written into `briefing.json` under `window` (`start`, `end`, `days`,
+`floor`, `max_age_days`) and into the notes header.
 
 ## How it works (v3 — the de-skew rewrite)
 
@@ -125,9 +156,20 @@ three M/F/Y meters, ticker chips, and a free-text badge. Hero = top composite pi
 
 ## Cron
 
-Research profile cron "Weekly STEM briefing" (`0 6 * * 1`) runs the generator and texts the
-top 3 over BlueBubbles. Report each as: title (italic); journal · field; M/F/You + composite;
+Research profile cron "Weekly STEM briefing" (`0 6 * * *`, daily) runs the generator, which
+decides for itself whether a window has closed. On most days it reports `WINDOW OPEN` and
+the job answers `[SILENT]`; on the day after a window ends it rebuilds and reports the top 3
+over BlueBubbles. Report each as: title (italic); journal · field; M/F/You + composite;
 tickers if any; free PDF / open page / paywalled with the link when free.
+
+Daily, not Mondays: the window end date rolls through the week, so a fixed weekday cannot
+line up with it. Never let the job `--force` an open window to have something to report.
+
+Two independent heal paths, either one is enough. The cron rewrites the JSON at 6am; the
+widget itself checks every 5 minutes and rebuilds the moment `window.end` is in the past, so
+a missed or late cron (Mac asleep, ticker down) still updates the widget within minutes of
+login. The widget judges freshness by `window.end`, never by the file's mtime: two adjacent
+days share an ISO week, so a week-of-year comparison silently never fires.
 
 ## Pitfalls
 

@@ -31,6 +31,6 @@ PLIST
 echo "compiling…"
 swiftc -O -target arm64-apple-macosx14.0 \
   -framework AppKit -framework SwiftUI -framework Combine \
-  -o "$BIN" "$SRC"
+  -o "$BIN" "$SRC" "$(dirname "$SRC")/WidgetResize.swift"
 codesign --force --deep --sign - "$APP" 2>/dev/null || echo "ad-hoc signing skipped"
 echo "built $APP"

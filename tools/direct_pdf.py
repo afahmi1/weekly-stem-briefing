@@ -152,16 +152,30 @@ def _from_landing(doi: str):
             base = r.geturl()
     except Exception:  # noqa: BLE001
         return None
-    hrefs = re.findall(r'(?:href|src)\s*=\s*"([^"]+)"', html)
+    origin = base.split("/", 3)[0] + "//" + base.split("/", 3)[2]
+    host = re.sub(r"^www\.", "", base.split("/", 3)[2].lower())  # 3.9-safe
+    # Article PDF signals first: the citation_pdf_url meta tag, then the
+    # M2community/xmlink platform's journal_download('pdf', id, 'file.pdf') JS
+    # hook (Neurospine, JMISST, Asian Spine J...) which serves /upload/pdf/file.pdf.
+    meta = re.findall(r'name="citation_pdf_url"\s+content="([^"]+)"', html)
+    jd = [f"{origin}/upload/pdf/{f}" for f in
+          re.findall(r"journal_download\(\s*'pdf'\s*,\s*'[^']*'\s*,\s*'([^']+\.pdf)'", html)]
+    hrefs = meta + jd + re.findall(r'(?:href|src)\s*=\s*["\']([^"\']+)["\']', html)
     seen, cands = set(), []
     for h in hrefs:
         low = h.lower()
+        # Supplementary files and figure/table PDFs are not the article.
+        if re.search(r"suppl|supporting|figure|-fig-|table|appendix|_reference|references?\.pdf|citation", low):
+            continue
         if any(k in low for k in ("/pdf", ".pdf", "pdfdirect", "pdfft", "stamp.jsp")):
             if h.startswith("//"):
                 h = "https:" + h
             elif h.startswith("/"):
-                h = base.split("/", 3)[0] + "//" + base.split("/", 3)[2] + h
+                h = origin + h
             elif not h.startswith("http"):
+                continue
+            # Reference lists link other papers' PDFs: stay on the article's host.
+            if h not in meta and host not in h.lower():
                 continue
             if h not in seen:
                 seen.add(h)

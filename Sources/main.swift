@@ -5,8 +5,11 @@ import SwiftUI
 import Combine
 
 let renderMode = CommandLine.arguments.contains("--render")
-let WIDGET_W: CGFloat = 380
+let WIDGET_W: CGFloat = 380         // design size, also the double-click reset target
 let WIDGET_H: CGFloat = 470
+let MIN_W: CGFloat = 340
+let MIN_H: CGFloat = 420
+let SIZE_KEY = "weeklystembriefing.frame"
 
 // MARK: - Model (flat rows: section / paper / headline) + 3-axis enrichment
 struct Row: Codable {
@@ -46,10 +49,18 @@ struct Row: Codable {
     var displayField: String { field ?? "" }
 }
 struct Stat: Codable { let label: String; let value: String }
+/// The window the digest covers. `end` is the day the week closes: the next build is
+/// due the morning after it, so freshness is judged against this date, not the file's
+/// mtime (Nov 5 and Nov 6 share an ISO week, so a week-of-year check never fires).
+struct Window: Codable {
+    var start: String?
+    var end: String?
+}
 struct Briefing: Codable {
     var title: String = "Weekly STEM Briefing"
     var subtitle: String = ""
     var generated: String = ""
+    var window: Window?
     var stats: [Stat] = []
     var rows: [Row] = []
 }
@@ -83,7 +94,14 @@ let sciOrange = Color(red: 0.96, green: 0.60, blue: 0.30)
 
 func prettyDate(_ s: String) -> String {
     let p = DateFormatter(); p.dateFormat = "yyyy-MM-dd"
-    if let d = p.date(from: s) { let f = DateFormatter(); f.dateFormat = "MMM d"; return f.string(from: d) }
+    if let d = p.date(from: s) {
+        let f = DateFormatter()
+        // Show the year whenever it is not this year, so an out-of-window paper is
+        // visible at a glance instead of reading like this week's work.
+        let y = Calendar.current.component(.year, from: d)
+        f.dateFormat = (y == Calendar.current.component(.year, from: Date())) ? "MMM d" : "MMM d, yyyy"
+        return f.string(from: d)
+    }
     return String(s.prefix(12))
 }
 func openURLString(_ s: String) { if !s.isEmpty, let u = URL(string: s) { NSWorkspace.shared.open(u) } }
@@ -94,6 +112,12 @@ struct ChatMsg: Identifiable { let id = UUID(); let role: String; let text: Stri
 final class Store: ObservableObject {
     @Published var data = Briefing()
     @Published var busy = false
+
+    private var freshnessTimer: Timer?
+    private var lastDataModification: Date?
+    private var lastAutoRefreshAttempt: Date?
+    private let freshnessCheckInterval: TimeInterval = 300
+    private let autoRefreshRetryInterval: TimeInterval = 6 * 60 * 60
 
     // per-article AI chat
     @Published var chatArticle: Row? = nil
@@ -137,10 +161,73 @@ final class Store: ObservableObject {
         if let u = URL(string: articleURL(r)) { NSWorkspace.shared.open(u) }
     }
 
+    private func modificationDate() -> Date? {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: dataURL().path)
+        return attrs?[.modificationDate] as? Date
+    }
+
+    private static func weekToken(_ date: Date) -> String {
+        let c = Calendar(identifier: .iso8601).dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
+        return "\(c.yearForWeekOfYear ?? 0)-\(c.weekOfYear ?? 0)"
+    }
+
+    /// Local calendar day as yyyy-MM-dd. String comparison against `window.end` is the
+    /// freshness test: same date format, no timezone math to get wrong.
+    private static func isoDay(_ now: Date = Date()) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f.string(from: now)
+    }
+
+    /// A window is closed once today is past its end date; that is the refresh trigger.
+    private func windowHasClosed(now: Date = Date()) -> Bool {
+        guard let end = data.window?.end, end.count == 10 else { return false }
+        return Store.isoDay(now) > end
+    }
+
     func load() {
         if let d = try? Data(contentsOf: dataURL()),
-           let b = try? JSONDecoder().decode(Briefing.self, from: d) { self.data = b }
+           let b = try? JSONDecoder().decode(Briefing.self, from: d) {
+            self.data = b
+            lastDataModification = modificationDate()
+        }
     }
+
+    /// Keep the visible widget in step with the file on disk, and rebuild it the first
+    /// time we notice the window has closed. Two independent heal paths: the daily cron
+    /// rewrites the JSON, and this check rebuilds it if cron did not (Mac asleep, job
+    /// missed). Retries are throttled so a dead network cannot spin.
+    func startAutoRefresh() {
+        checkFreshness()
+        let timer = Timer(timeInterval: freshnessCheckInterval, repeats: true) { [weak self] _ in
+            self?.checkFreshness()
+        }
+        freshnessTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func checkFreshness(now: Date = Date()) {
+        if let modified = modificationDate(), modified != lastDataModification {
+            load()
+        }
+        guard !busy else { return }
+        // Due when today is past the window's end date. Falls back to the ISO-week check
+        // for a briefing written before the window field existed.
+        let due: Bool
+        if data.window?.end?.count == 10 {
+            due = windowHasClosed(now: now)
+        } else if let modified = modificationDate() {
+            due = Store.weekToken(modified) != Store.weekToken(now)
+        } else {
+            due = data.rows.isEmpty      // no file at all (fresh install): build one
+        }
+        guard due else { return }
+        if let last = lastAutoRefreshAttempt, now.timeIntervalSince(last) < autoRefreshRetryInterval { return }
+        lastAutoRefreshAttempt = now
+        refresh()
+    }
+
     func refresh() {
         guard !busy else { return }
         busy = true
@@ -501,7 +588,7 @@ struct ContentView: View {
             footer
         }
         .padding(.horizontal, 14).padding(.top, 7).padding(.bottom, 10)
-        .frame(width: WIDGET_W, height: WIDGET_H)
+        .frame(minWidth: MIN_W, maxWidth: .infinity, minHeight: MIN_H, maxHeight: .infinity)
         .background(WidgetBackdrop(tint: tint))
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
@@ -679,7 +766,7 @@ struct ChatView: View {
             }
         }
         .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 12)
-        .frame(width: WIDGET_W, height: WIDGET_H)
+        .frame(minWidth: MIN_W, maxWidth: .infinity, minHeight: MIN_H, maxHeight: .infinity)
         .background(
             ZStack {
                 if renderMode { Color(red: 0.07, green: 0.072, blue: 0.085) }
@@ -695,32 +782,21 @@ final class WidgetWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 }
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var window: WidgetWindow!
     var statusItem: NSStatusItem!
+    var toggleItem: NSMenuItem?
     let store = Store()
-    let modeKey = "WeeklyStemBriefingDesktopMode"
     var desktopMode: Bool {
-        get { UserDefaults.standard.bool(forKey: modeKey) }
-        set { UserDefaults.standard.set(newValue, forKey: modeKey); applyLevel() }
+        get { WidgetLayer.pinned }
+        set { WidgetLayer.pinned = newValue; applyLevel() }
     }
-    func applyLevel() {
-        if desktopMode {
-            // pinned to the desktop, behind other windows (per his standing rule)
-            window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) - 1)
-            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
-        } else {
-            // normal, freely draggable, never forced on top
-            window.level = .normal
-            window.collectionBehavior = [.canJoinAllSpaces]
-        }
-    }
+    func applyLevel() { WidgetLayer.apply(window) }
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.appearance = NSAppearance(named: .darkAqua)
-        // Always come up in the freely-draggable normal layer; the user can
-        // re-pin to the desktop from the menu if they want it behind windows.
-        UserDefaults.standard.set(false, forKey: modeKey)
+        // Load immediately, then watch the cron output and self-heal a missed weekly run.
         store.load()
+        store.startAutoRefresh()
 
         // headless self-test of the AI shell-out (exercises the real code path)
         if CommandLine.arguments.contains("--ask-test") {
@@ -733,6 +809,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil); return
         }
 
+        let sizeBits = (ProcessInfo.processInfo.environment["WIDGET_RENDER_SIZE"] ?? "380x470")
+            .split(separator: "x")
+        let renderSize = CGSize(width: Double(sizeBits.first ?? "380") ?? 380,
+                                height: sizeBits.count > 1 ? (Double(sizeBits[1]) ?? 470) : 470)
         if let i = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.arguments.count > i + 1 {
             let out = CommandLine.arguments[i + 1]
             if CommandLine.arguments.contains("--chat"),
@@ -743,7 +823,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     ChatMsg(role: "ai", text: "It refines how clinicians grade lesion difficulty before endoscopic removal, which standardizes case selection and training and nudges adoption of endoscopic resection over surgery — relevant to scope makers and surgical-robotics players. Caveat: a scoring-optimization paper, not a new device or an outcomes trial.")]
             }
             let r = ImageRenderer(content: ContentView(store: store).environment(\.colorScheme, .dark)
-                .frame(width: WIDGET_W, height: WIDGET_H))
+                .frame(width: renderSize.width, height: renderSize.height))
             r.scale = 2
             if let img = r.nsImage, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
                let png = rep.representation(using: .png, properties: [:]) {
@@ -753,19 +833,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let hosting = NSHostingView(rootView: ContentView(store: store))
-        hosting.setFrameSize(NSSize(width: WIDGET_W, height: WIDGET_H))
-        window = WidgetWindow(contentRect: NSRect(x: 0, y: 0, width: WIDGET_W, height: WIDGET_H),
+        let size = WidgetResize.savedSize(key: SIZE_KEY,
+                                         fallback: NSSize(width: WIDGET_W, height: WIDGET_H),
+                                         min: NSSize(width: MIN_W, height: MIN_H))
+        hosting.setFrameSize(size)
+        window = WidgetWindow(contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless, .fullSizeContentView], backing: .buffered, defer: false)
-        window.contentView = hosting
+        WidgetResize.install(window: window, hosting: hosting,
+                             minSize: NSSize(width: MIN_W, height: MIN_H),
+                             defaultSize: NSSize(width: WIDGET_W, height: WIDGET_H),
+                             key: SIZE_KEY)
         window.isOpaque = false; window.backgroundColor = .clear; window.hasShadow = true
         window.isMovableByWindowBackground = true; window.hidesOnDeactivate = false
         applyLevel()
         if let scr = NSScreen.main {
             let f = scr.visibleFrame
-            window.setFrameOrigin(NSPoint(x: f.maxX - WIDGET_W - 24, y: f.maxY - WIDGET_H - 24))
+            let size = window.frame.size
+            window.setFrameOrigin(NSPoint(x: f.maxX - size.width - 24, y: f.maxY - size.height - 24))
         }
         window.orderFront(nil)
+        WidgetPin.install(window: window) { [weak self] in
+            self?.homeOrigin() ?? NSPoint(x: 40, y: 40)
+        }
+        WidgetBus.observe { [weak self] command in
+            guard let self else { return }
+            switch command {
+            case .hideAll:
+                self.window.orderOut(nil)
+            case .showAll:
+                let size = self.window.frame.size
+                self.window.setFrameOrigin(self.homeOrigin())
+                _ = size
+                self.applyLevel()
+                self.window.orderFront(nil)
+            }
+        }
         makeStatusItem()
+
+        if CommandLine.arguments.contains("--toggle-test") { runToggleTestIfAsked() }
+        if CommandLine.arguments.contains("--pin-test") { WidgetPin.runSelfTest(window: window, home: { [weak self] in self?.homeOrigin() ?? .zero }) }
     }
 
     func makeStatusItem() {
@@ -774,15 +880,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image?.isTemplate = true
         rebuildMenu()
     }
-    func rebuildMenu() { statusItem.menu = buildMenu() }
+    func rebuildMenu() {
+        let m = buildMenu()
+        m.delegate = self
+        statusItem.menu = m
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        toggleItem?.title = window.isVisible ? "Hide Weekly Briefing" : "Show Weekly Briefing"
+    }
     func buildMenu() -> NSMenu {
         let m = NSMenu()
         func add(_ title: String, _ sel: Selector, _ key: String = "", state: NSControl.StateValue? = nil) {
             let mi = NSMenuItem(title: title, action: sel, keyEquivalent: key); mi.target = self
             if let s = state { mi.state = s }; m.addItem(mi)
         }
-        add("Show / Hide widget", #selector(toggleVisible))
+        let toggle = NSMenuItem(title: "Hide Weekly Briefing", action: #selector(toggleVisible), keyEquivalent: "")
+        toggle.target = self
+        toggleItem = toggle
+        m.addItem(toggle)
+        add("Hide all widgets", #selector(hideAllWidgets))
+        add("Show all widgets", #selector(showAllWidgets))
+        m.addItem(.separator())
         add("Pin to desktop (behind windows)", #selector(toggleDesktop), state: desktopMode ? .on : .off)
+        // global hotkeys inline, disabled rows so they read as reference
+        let keysItem = NSMenuItem(title: "Widget hotkeys", action: nil, keyEquivalent: "")
+        let keysMenu = NSMenu()
+        for (name, key) in [("Volume Mixer", "m"), ("Holding Shelf", "s")] {
+            let row = NSMenuItem(title: name, action: nil, keyEquivalent: key)
+            row.keyEquivalentModifierMask = [.shift, .command]
+            row.isEnabled = false
+            keysMenu.addItem(row)
+        }
+        keysMenu.addItem(.separator())
+        let mapItem = NSMenuItem(title: "Full key map\u{2026}", action: #selector(openKeyMap), keyEquivalent: "")
+        mapItem.target = self
+        keysMenu.addItem(mapItem)
+        keysItem.submenu = keysMenu
+        m.addItem(keysItem)
         // which university proxy unlocks paywalled papers
         let libItem = NSMenuItem(title: "Library for paywalled papers", action: nil, keyEquivalent: "")
         let lib = NSMenu()
@@ -795,6 +930,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         libItem.submenu = lib; m.addItem(libItem)
         m.addItem(.separator())
         add("Refresh now", #selector(refreshNow), "r")
+        add("Reset size", #selector(resetSize))
         add("Move: top-right", #selector(moveTR))
         add("Move: center", #selector(moveCenter))
         add("Open data folder", #selector(openData))
@@ -813,16 +949,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         desktopMode.toggle(); rebuildMenu(); window.orderFront(nil)
     }
     @objc func refreshNow() { store.refresh() }
+
+    /// The full widget key map, kept in one file rather than duplicated per app.
+    @objc func openKeyMap() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory() + "/WIDGETS.md"))
+    }
+
+    func runToggleTestIfAsked() {
+        guard CommandLine.arguments.contains("--toggle-test") else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            let before = self.window.isVisible
+            self.toggleVisible()
+            let hidden = self.window.isVisible
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                self.toggleVisible()
+                let back = self.window.isVisible
+                print("toggle-test: visible=\(before) afterHide=\(hidden) afterShow=\(back)")
+                print(!hidden && back ? "PASS" : "FAIL")
+                exit(!hidden && back ? 0 : 1)
+            }
+        }
+    }
     @objc func openData() {
         NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/WeeklyStemBriefing"))
     }
+    /// Home slot: top-right, 24pt in. Movable while working, pinned here on lock.
+    private func homeOrigin() -> NSPoint {
+        guard let vf = NSScreen.main?.visibleFrame else { return window.frame.origin }
+        let size = window.frame.size
+        return NSPoint(x: vf.maxX - size.width - 24, y: vf.maxY - size.height - 24)
+    }
+
     private func place(_ pick: (NSRect) -> NSPoint) {
         guard let scr = NSScreen.main else { return }
         window.setFrameOrigin(pick(scr.visibleFrame)); window.orderFront(nil)
     }
-    @objc func moveTR() { place { f in NSPoint(x: f.maxX - WIDGET_W - 24, y: f.maxY - WIDGET_H - 24) } }
-    @objc func moveCenter() { place { f in NSPoint(x: f.midX - WIDGET_W/2, y: f.midY - WIDGET_H/2) } }
+    @objc func moveTR() {
+        place { f in
+            let s = window.frame.size
+            return NSPoint(x: f.maxX - s.width - 24, y: f.maxY - s.height - 24)
+        }
+    }
+    @objc func moveCenter() {
+        place { f in
+            let s = window.frame.size
+            return NSPoint(x: f.midX - s.width/2, y: f.midY - s.height/2)
+        }
+    }
+    @objc func hideAllWidgets() { WidgetBus.post(.hideAll) }
+    @objc func showAllWidgets() { WidgetBus.post(.showAll) }
+
+    @objc func resetSize() {
+        ResizeOverlayView.resetSize(window: window,
+                                    to: NSSize(width: WIDGET_W, height: WIDGET_H),
+                                    key: SIZE_KEY)
+        window.orderFront(nil)
+    }
     @objc func quitApp() { NSApp.terminate(nil) }
 }
 

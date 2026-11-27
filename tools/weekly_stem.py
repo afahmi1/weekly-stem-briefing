@@ -198,6 +198,9 @@ def to_item(w: dict, score_parts: bool = True) -> dict:
         "title": clean(w.get("title")),
         "journal": journal,
         "date": w.get("publication_date") or "",
+        # OpenAlex sometimes dates a work to its issue/reindex date while the paper
+        # itself is older. Keep the declared year so callers can guard against it.
+        "year": w.get("publication_year"),
         "doi": doi,
         "url": f"https://doi.org/{doi}" if doi else (w.get("id") or ""),
         "authors": authors,

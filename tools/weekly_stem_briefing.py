@@ -21,10 +21,15 @@ fallback. Writes:
   ~/.hermes/profiles/research/notes/weekly-stem-briefing-<date>.md (notes vault)
 
 Usage:
-  weekly_stem_briefing.py                      # last 7 days, defaults
+  weekly_stem_briefing.py                      # build the next chained window
+  weekly_stem_briefing.py --status             # window state only, no network
   weekly_stem_briefing.py --top 14 --headlines 4
   weekly_stem_briefing.py --no-fulltext        # skip resolver (fast)
   weekly_stem_briefing.py --dry-run
+  weekly_stem_briefing.py --force              # rebuild an open window
+
+The window chains off the last briefing: a run reads window.end from briefing.json and only
+builds once today is past it, producing end -> end + days. An open window is a no-op.
 """
 from __future__ import annotations
 import argparse, datetime as dt, json, pathlib, sys, urllib.parse, urllib.request
@@ -65,6 +70,12 @@ FIELD_ORDER = ["Medicine", "Bio", "Neuro", "Immuno", "Physics", "Astronomy",
                "Chemistry", "Materials", "CS", "Engineering", "Earth", "Math", "Pharma"]
 PER_FIELD_CAP = 2          # at most this many per field in the balanced set
 PER_JOURNAL_CAP = 1        # at most this many per journal (maximize variety)
+
+# Hard ceiling: nothing older than this, measured back from the window end, is ever
+# queried or kept. --days can never exceed it, and every returned paper is re-checked
+# against it (OpenAlex will date a work to its issue/reindex date, so the filter alone
+# is not proof).
+MAX_AGE_DAYS = 182         # ~6 months
 
 
 def get_text(url, timeout=30):
@@ -197,6 +208,45 @@ def add_scihub(items):
             it["scihub"] = f"https://sci-hub.ru/{it['doi']}"
 
 
+def previous_window():
+    """(start, end) of the briefing already on disk, or None.
+
+    This is the chain anchor: each new briefing starts where the last one ended, so
+    windows tile the calendar and the "Week of X -> Y" header rolls forward on its own
+    instead of always meaning "the 7 days before today".
+    """
+    try:
+        payload = json.loads((OUT / "briefing.json").read_text())
+        w = payload.get("window") or {}
+        return dt.date.fromisoformat(w["start"]), dt.date.fromisoformat(w["end"])
+    except Exception:  # noqa: BLE001  missing, partial, or pre-window-schema file
+        return None
+
+
+def resolve_window(today, prev, days, pin_end=None, force=False, dry_run=False):
+    """Pick the window to build. Pure, so the chain logic is testable without a network.
+
+    Returns (start, end, chained, skip) where skip is None when a build is due, or the
+    (start, end) of the window still open when it is not.
+    """
+    if pin_end is not None:
+        return pin_end - dt.timedelta(days=days), pin_end, False, None
+    if prev is None:
+        return today - dt.timedelta(days=days), today, False, None
+    p_start, p_end = prev
+    if today > p_end:
+        # The window closed: the next one starts exactly where it ended, so consecutive
+        # briefings tile the calendar instead of overlapping, and the header advances on
+        # its own. Catch-up is lossless: a run that missed two weeks builds the earliest
+        # outstanding window and the next run builds the one after it.
+        return p_end, p_end + dt.timedelta(days=days), True, None
+    if force or dry_run:
+        # Not due. --force rebuilds the same window; --dry-run is allowed through because
+        # it writes nothing (the documented fast-pass check uses it).
+        return p_end - dt.timedelta(days=days), p_end, False, None
+    return None, None, False, (p_start, p_end)
+
+
 def _has_pdf(it: dict) -> bool:
     """Can he actually open this? Free/sci-hub full text, or a real PDF endpoint."""
     if it.get("ft_kind") in ("pdf", "page") and it.get("ft_url"):
@@ -207,6 +257,9 @@ def _has_pdf(it: dict) -> bool:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--max-age-days", type=int, default=MAX_AGE_DAYS,
+                    help=f"hard ceiling: never look further back than this from --end "
+                         f"(default {MAX_AGE_DAYS}); --days is clamped to it")
     ap.add_argument("--top", type=int, default=14, help="field-balanced papers to keep")
     ap.add_argument("--backfill", type=int, default=6,
                     help="extra candidates resolved so unreachable papers can be replaced")
@@ -214,16 +267,74 @@ def main():
     ap.add_argument("--pages", type=int, default=2, help="OpenAlex pages (x200) to scan")
     ap.add_argument("--no-fulltext", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--end", help="ISO end date (default today)")
+    ap.add_argument("--end", help="ISO end date (pins the window; skips chaining)")
+    ap.add_argument("--force", action="store_true",
+                    help="rebuild even if the current window has not closed yet")
+    ap.add_argument("--status", action="store_true",
+                    help="print the window state (open/closed, next refresh) and exit")
     args = ap.parse_args()
 
-    end = dt.date.fromisoformat(args.end) if args.end else dt.date.today()
-    start = end - dt.timedelta(days=args.days)
+    # Hard ceiling first: no flag combination may reach past max-age days from the week.
+    max_age = max(1, min(args.max_age_days, MAX_AGE_DAYS))
+    days = min(args.days, max_age)
+    if days != args.days:
+        print(f"window clamped: --days {args.days} -> {days} (max age {max_age} days)",
+              file=sys.stderr)
+
+    today = dt.date.today()
+    prev = previous_window()
+
+    if args.status:
+        if prev is None:
+            print(f"no briefing on disk yet · today {today} · "
+                  f"first run will cover {today - dt.timedelta(days=days)}..{today}")
+        else:
+            p_start, p_end = prev
+            state = "CLOSED (refresh due)" if today > p_end else "OPEN"
+            print(f"current window {p_start}..{p_end} · {state} · today {today} · "
+                  f"next refresh {p_end + dt.timedelta(days=1)}")
+        return 0
+
+    chained = False
+    start, end, chained, skip = resolve_window(
+        today, prev, days,
+        pin_end=dt.date.fromisoformat(args.end) if args.end else None,
+        force=args.force, dry_run=args.dry_run)
+    if skip is not None:
+        p_start, p_end = skip
+        print(f"WINDOW OPEN: {p_start}..{p_end} is still current "
+              f"({(p_end - today).days + 1} day(s) left, closes end of {p_end}). "
+              f"Next refresh {p_end + dt.timedelta(days=1)}: nothing to do.")
+        return 0
+
+    floor = end - dt.timedelta(days=max_age)
+    print(f"window {start}..{end}"
+          + (" (chained from the previous window)" if chained else ""))
 
     # 1. broad pull, score, classify, enrich
     works = fetch_openalex_pool(start, end, pages=args.pages)
     pool = [ws.to_item(w) for w in works]
     pool = [i for i in pool if i["title"] and i["journal"]]
+
+    # 1b. Re-prove the window on what actually came back. OpenAlex will date a work to
+    # its issue date, so a filter match is not proof the paper is that recent; anything
+    # dated outside [floor, end] is dropped here, before it can take a slot.
+    kept, stale = [], 0
+    for it in pool:
+        try:
+            d = dt.date.fromisoformat(it.get("date") or "")
+        except ValueError:
+            # No usable day: the year alone can't prove a paper is under 6 months old
+            # (a "2026" paper could be from January), so it is dropped, never guessed in.
+            stale += 1
+            continue
+        if floor <= d <= end:
+            kept.append(it)
+        else:
+            stale += 1
+    if stale:
+        print(f"dropped {stale} papers outside {floor}..{end}", file=sys.stderr)
+    pool = kept
     scanned = len(pool)
     for it in pool:
         it["kind"] = "paper"; it["source"] = "journal"
@@ -249,10 +360,21 @@ def main():
         if it.get("ft_kind") not in ("pdf", "page") and "sci-hub" not in (it.get("ft_host") or "").lower():
             try:
                 r = direct_pdf.resolve(it.get("doi", ""))
+                if not r.get("pdf_direct"):
+                    # Small society hosts (e-neurospine.org) answer in 5-12 s and
+                    # time out intermittently; one retry stops a top pick being dropped.
+                    r = direct_pdf.resolve(it.get("doi", ""))
                 it["pdf_direct"] = r.get("pdf_direct", "")
                 it["pdf_probe"] = r.get("probe", "")
             except Exception as e:  # noqa: BLE001
                 print(f"direct_pdf {it.get('doi')}: {type(e).__name__}", file=sys.stderr)
+        # A probed-verified direct endpoint IS a free PDF (Zenodo deposits, some
+        # OA journals): say so instead of badging the paper closed.
+        if it.get("ft_kind") not in ("pdf", "page") and it.get("pdf_probe") == "verified" \
+                and it.get("pdf_direct"):
+            it["ft_kind"] = "pdf"
+            it["ft_url"] = it["pdf_direct"]
+            it["ft_host"] = it.get("ft_host") or "Publisher direct PDF"
 
     # 4. DROP anything with no reachable PDF (free, Sci-Hub, or a real publisher
     # direct-PDF endpoint). A paper he cannot open is not worth a slot.
@@ -312,7 +434,8 @@ def main():
         "subtitle": f"Week of {start.isoformat()} \u2192 {end.isoformat()}",
         "generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
-        "window": {"start": start.isoformat(), "end": end.isoformat(), "days": args.days},
+        "window": {"start": start.isoformat(), "end": end.isoformat(), "days": days,
+                   "floor": floor.isoformat(), "max_age_days": max_age},
         "scanned": scanned, "fulltext": ft_stats,
         "axes": {"m": "Market impact", "f": "Field impact", "p": "Personal appeal"},
         "fields_covered": fields_covered,
@@ -334,7 +457,8 @@ def main():
 
     NOTES.mkdir(parents=True, exist_ok=True)
     md = [f"# Weekly STEM Briefing {end.isoformat()}\n",
-          f"Window {start} to {end} \u00b7 {scanned} scanned \u00b7 {len(papers)} ranked across "
+          f"Window {start} to {end} (no paper older than {max_age} days, floor {floor}) \u00b7 "
+          f"{scanned} scanned \u00b7 {len(papers)} ranked across "
           f"{len(fields_covered)} fields ({', '.join(fields_covered)}) \u00b7 "
           f"{len(headlines)} headlines\n",
           "\nRanked by composite of **Market** / **Field** / **Personal** (0-100 each).\n"]
