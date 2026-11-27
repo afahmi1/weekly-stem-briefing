@@ -130,7 +130,7 @@ paper with no Sci-Hub copy shows `via SJSU/BU`.
 ## Widget
 
 Native SwiftUI/AppKit panel (no Xcode): `~/WeeklyStemBriefing/` (`Sources/main.swift`,
-`build-app.sh`). **380x470** (small). Each card shows field tag, title, 1-line summary, the
+`build-app.sh`). **420 × 420** by default; previously saved sizes are preserved. Each card shows field tag, title, 1-line summary, the
 three M/F/Y meters, ticker chips, and a free-text badge. Hero = top composite pick.
 
 - **Ask AI** — every card (hero + rows) has a ✨ ASK pill. It opens an in-widget chat about
@@ -140,13 +140,16 @@ three M/F/Y meters, ticker chips, and a free-text badge. Hero = top composite pi
   brief and NOT invent findings when the abstract is missing. Code: `Store.runClaude` +
   `ChatView`/`ChatBubble`. The shell-out sets HOME/USER/LOGNAME/PATH explicitly — claude needs
   USER/LOGNAME or it reports "Not logged in" under a launchd-minimal env.
-- Rebuild: `bash ~/WeeklyStemBriefing/build-app.sh`
-- Offscreen checks: `...WeeklyStemBriefing --render /tmp/wsb.png` (briefing; shows first 3
-  entries so chrome fits the frame — the live app scrolls), `--render /tmp/c.png --chat`
-  (chat view with a seeded Q&A; the TextField renders as a yellow box in ImageRenderer, an
-  artifact only), and `--ask-test` (headless end-to-end test of the Claude shell-out — prints
-  a real answer about the top paper). `swiftc` here has NO SwiftUI macro plugin, so `@State`
-  is unavailable; keep view-local mutable state on the `Store` (`@Published`) instead.
+- **Appearance**: sparkles menu → Appearance… opens live previews for Thermocline (default)
+  or Classic, System/Light/Dark, and seven Thermocline accents (Crown default). Classic + Dark
+  restores the original dark skin and field colors. Preferences persist across launches.
+- Rebuild: `bash build-app.sh` builds into the checkout's own `build/` directory. To avoid
+  replacing the live bundle, build from a worktree. Do not relaunch just to verify appearance.
+- Offscreen checks: `...WeeklyStemBriefing --render-appearance /path/to/widget.png --mode light`
+  renders a deterministic fixture; `--render-settings /path/to/settings.png` renders the picker.
+  `--render /path/to/chat.png --fixture --chat` shows a seeded Q&A. These commands open no window
+  and do not refresh or write the live briefing. `tools/test_widget_snapshots.py` runs the matrix.
+  `--ask-test` is a separate headless test that calls the real Claude CLI.
 - Relaunch: `pkill -x WeeklyStemBriefing; launchctl kickstart -k gui/$(id -u)/local.abduel.weeklystembriefing`
 - **Movable**: launches in the normal (freely draggable) layer every time — drag it anywhere
   by the background or the top grabber pill. It does NOT float above other windows. The menu-bar

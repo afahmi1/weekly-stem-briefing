@@ -63,8 +63,42 @@ To start it at login, save this as `~/Library/LaunchAgents/local.weeklystembrief
 launchctl load ~/Library/LaunchAgents/local.weeklystembriefing.plist
 ```
 
-The widget appears top-right. Drag it anywhere by the top bar. The ✨ menu-bar icon
-has Refresh, Show/Hide, and the library-proxy switcher.
+The widget appears top-right at **420 × 420** on a fresh install and keeps any saved
+custom size. Drag it by the top bar or resize it from an edge. It does not float over
+other apps. The sparkles menu-bar icon has Refresh, Show/Hide, and the library-proxy switcher.
+
+### Appearance
+
+Open **sparkles menu → Appearance…**. The menu shows your current settings; the popover
+shows each theme, mode and accent before you pick it. Choices apply immediately and are saved.
+
+- **Theme:** Thermocline v1.1 by default; **Classic** keeps the original field colors,
+  gradients and typography. Choose **Classic + Dark** for the original dark look.
+- **Mode:** System (default), Light, or Dark for either theme.
+- **Accent:** Crown (default), Wing, Gold, Cheek, Chestnut, Plum, or Green in Thermocline.
+  Classic keeps its own color coding and remembers your Thermocline accent for later.
+
+The default uses Crown for the top pick, score bars and refresh without a background glow.
+Reduce Transparency replaces glass with a solid surface, and Reduce Motion disables animated
+score and chat transitions.
+
+### Verify a build without launching the widget
+
+`build-app.sh` builds into `build/` beside the script, including from a Git worktree.
+Use the build's binary directly to render a fixture to PNG; it won't create a window,
+refresh the briefing, or request Screen Recording permission:
+
+```bash
+bash build-app.sh
+BIN=./build/WeeklyStemBriefing.app/Contents/MacOS/WeeklyStemBriefing
+"$BIN" --render-appearance ./build/widget-light.png --mode light
+"$BIN" --render-settings ./build/appearance.png --mode dark
+python3 tools/test_widget_snapshots.py
+```
+
+Add `--theme classic --mode dark` for the original skin or `--accent wing` to preview
+another accent. `WIDGET_RENDER_SIZE=340x420` previews a narrower size. `Sources/Thermocline.swift`
+is the unmodified v1.1 SwiftUI distribution.
 
 ---
 
