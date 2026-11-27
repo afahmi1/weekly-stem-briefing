@@ -126,18 +126,25 @@ def europepmc(doi: str) -> list[dict]:
     return [o for o in out if o["url"]]
 
 
+def _article_pdf(u: str) -> str:
+    """OpenAlex often stores Springer Nature's reference-list export
+    ('<id>_reference.pdf') as the pdf_url. The article PDF is the same path
+    without the suffix."""
+    return re.sub(r"_reference\.pdf$", ".pdf", u or "")
+
+
 def openalex(doi: str) -> list[dict]:
     d = get_json("https://api.openalex.org/works/https://doi.org/"
                  + urllib.parse.quote(doi) + f"?mailto={MAILTO}")
     out = []
     best = d.get("best_oa_location") or {}
     if best.get("pdf_url"):
-        out.append({"url": best["pdf_url"], "host": (best.get("source") or {}).get(
+        out.append({"url": _article_pdf(best["pdf_url"]), "host": (best.get("source") or {}).get(
             "display_name") or "OpenAlex", "kind": "pdf", "version": best.get("version") or ""})
     for loc in (d.get("locations") or [])[:8]:
         if not loc.get("is_oa"):
             continue
-        u = loc.get("pdf_url")
+        u = _article_pdf(loc.get("pdf_url"))
         if u:
             out.append({"url": u, "host": (loc.get("source") or {}).get("display_name") or "",
                         "kind": "pdf", "version": loc.get("version") or ""})
@@ -187,6 +194,47 @@ def preprints(doi: str) -> list[dict]:
         for host in ("www.biorxiv.org", "www.medrxiv.org"):
             out.append({"url": f"https://{host}/content/{doi}v1.full.pdf", "host": host,
                         "kind": "pdf", "version": "preprint"})
+    return out
+
+
+def zenodo(doi: str) -> list[dict]:
+    """Zenodo deposits (10.5281/zenodo.<id>) are OA, but the file name is arbitrary.
+
+    The concept DOI (…zenodo.23531861) and the version record (…862) differ, so the
+    API is asked for the record first and the concept-doi search is the fallback.
+    """
+    m = re.search(r"zenodo\.(\d+)", doi, re.I)
+    if not m:
+        return []
+    rid = m.group(1)
+    out: list[dict] = []
+
+    def _files(rec) -> list[dict]:
+        fs = (rec or {}).get("files") or []
+        if isinstance(fs, dict):                      # older API shape
+            fs = list((fs.get("entries") or {}).values())
+        return [f for f in fs if isinstance(f, dict)]
+
+    files: list[dict] = []
+    try:
+        files = _files(get_json(f"https://zenodo.org/api/records/{rid}"))
+    except Exception:  # noqa: BLE001 - concept DOIs have no record page
+        files = []
+    if not files:
+        try:
+            q = urllib.parse.quote(f'conceptdoi:"{doi}"')
+            d = get_json(f"https://zenodo.org/api/records?q={q}&sort=newest&size=1")
+            for hit in (d.get("hits") or {}).get("hits") or []:
+                files = _files(hit)
+                if files:
+                    break
+        except Exception:  # noqa: BLE001
+            files = []
+    for f in files:
+        u = ((f.get("links") or {}).get("self") or "")
+        if not u or not (f.get("key") or "").lower().endswith(".pdf"):
+            continue
+        out.append({"url": u, "host": "Zenodo", "kind": "pdf", "version": ""})
     return out
 
 
@@ -325,6 +373,7 @@ def scihub(doi: str, timeout: int = 90) -> list[dict]:
 
 ROUTES = {
     "europepmc": europepmc,
+    "zenodo": zenodo,
     "openalex": openalex,
     "unpaywall": unpaywall,
     "semanticscholar": semanticscholar,
@@ -353,8 +402,8 @@ def resolve(doi: str, *, title: str = "", short_circuit: bool = True,
     found: list[dict] = []
     if short_circuit:
         # Ordered probes, stop as soon as a PDF turns up.
-        for name in ("europepmc", "preprints", "openalex", "semanticscholar",
-                     "unpaywall", "crossref"):
+        for name in ("europepmc", "zenodo", "preprints", "openalex",
+                     "semanticscholar", "unpaywall", "crossref"):
             try:
                 got = ROUTES[name](doi) or []
             except Exception as e:  # noqa: BLE001

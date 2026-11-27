@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# Build WeeklyStemBriefing.app with swiftc only.
+# Build WeeklyStemBriefing.app with swiftc only (Command Line Tools, no Xcode).
+# Checkout-relative: every path is resolved from this script's own location, never $HOME.
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="$SCRIPT_DIR/Sources"
+BUILD_DIR="$SCRIPT_DIR/build"
 APP_NAME="WeeklyStemBriefing"
 BUNDLE_ID="local.abduel.weeklystembriefing"
-SRC="$HOME/WeeklyStemBriefing/Sources/main.swift"
-BUILD_DIR="$HOME/WeeklyStemBriefing/build"
 APP="$BUILD_DIR/$APP_NAME.app"
 BIN="$APP/Contents/MacOS/$APP_NAME"
+SOURCES=("$SRC_DIR/main.swift" "$SRC_DIR/WidgetResize.swift" "$SRC_DIR/WidgetAppearance.swift"
+         "$SRC_DIR/WidgetSnapshots.swift" "$SRC_DIR/Thermocline.swift")
+for source in "${SOURCES[@]}"; do
+  [[ -f "$source" ]] || { printf 'Missing source: %s\n' "$source" >&2; exit 1; }
+done
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -28,9 +36,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-echo "compiling…"
+
+echo "compiling (${#SOURCES[@]} sources):"
+printf '  %s\n' "${SOURCES[@]}"
 swiftc -O -target arm64-apple-macosx14.0 \
   -framework AppKit -framework SwiftUI -framework Combine \
-  -o "$BIN" "$SRC"
+  -o "$BIN" "${SOURCES[@]}"
 codesign --force --deep --sign - "$APP" 2>/dev/null || echo "ad-hoc signing skipped"
 echo "built $APP"

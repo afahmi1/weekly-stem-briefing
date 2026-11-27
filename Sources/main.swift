@@ -4,9 +4,12 @@ import AppKit
 import SwiftUI
 import Combine
 
-let renderMode = CommandLine.arguments.contains("--render")
-let WIDGET_W: CGFloat = 380
-let WIDGET_H: CGFloat = 470
+let renderMode = MainActor.assumeIsolated { WidgetSnapshots.isRenderRequested }
+let WIDGET_W: CGFloat = 420         // square design size; preserve saved custom sizes
+let WIDGET_H: CGFloat = 420
+let MIN_W: CGFloat = 340
+let MIN_H: CGFloat = 420
+let SIZE_KEY = "weeklystembriefing.frame"
 
 // MARK: - Model (flat rows: section / paper / headline) + 3-axis enrichment
 struct Row: Codable {
@@ -46,10 +49,18 @@ struct Row: Codable {
     var displayField: String { field ?? "" }
 }
 struct Stat: Codable { let label: String; let value: String }
+/// The window the digest covers. `end` is the day the week closes: the next build is
+/// due the morning after it, so freshness is judged against this date, not the file's
+/// mtime (Nov 5 and Nov 6 share an ISO week, so a week-of-year check never fires).
+struct Window: Codable {
+    var start: String?
+    var end: String?
+}
 struct Briefing: Codable {
     var title: String = "Weekly STEM Briefing"
     var subtitle: String = ""
     var generated: String = ""
+    var window: Window?
     var stats: [Stat] = []
     var rows: [Row] = []
 }
@@ -83,7 +94,14 @@ let sciOrange = Color(red: 0.96, green: 0.60, blue: 0.30)
 
 func prettyDate(_ s: String) -> String {
     let p = DateFormatter(); p.dateFormat = "yyyy-MM-dd"
-    if let d = p.date(from: s) { let f = DateFormatter(); f.dateFormat = "MMM d"; return f.string(from: d) }
+    if let d = p.date(from: s) {
+        let f = DateFormatter()
+        // Show the year whenever it is not this year, so an out-of-window paper is
+        // visible at a glance instead of reading like this week's work.
+        let y = Calendar.current.component(.year, from: d)
+        f.dateFormat = (y == Calendar.current.component(.year, from: Date())) ? "MMM d" : "MMM d, yyyy"
+        return f.string(from: d)
+    }
     return String(s.prefix(12))
 }
 func openURLString(_ s: String) { if !s.isEmpty, let u = URL(string: s) { NSWorkspace.shared.open(u) } }
@@ -94,6 +112,12 @@ struct ChatMsg: Identifiable { let id = UUID(); let role: String; let text: Stri
 final class Store: ObservableObject {
     @Published var data = Briefing()
     @Published var busy = false
+
+    private var freshnessTimer: Timer?
+    private var lastDataModification: Date?
+    private var lastAutoRefreshAttempt: Date?
+    private let freshnessCheckInterval: TimeInterval = 300
+    private let autoRefreshRetryInterval: TimeInterval = 6 * 60 * 60
 
     // per-article AI chat
     @Published var chatArticle: Row? = nil
@@ -137,10 +161,73 @@ final class Store: ObservableObject {
         if let u = URL(string: articleURL(r)) { NSWorkspace.shared.open(u) }
     }
 
+    private func modificationDate() -> Date? {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: dataURL().path)
+        return attrs?[.modificationDate] as? Date
+    }
+
+    private static func weekToken(_ date: Date) -> String {
+        let c = Calendar(identifier: .iso8601).dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
+        return "\(c.yearForWeekOfYear ?? 0)-\(c.weekOfYear ?? 0)"
+    }
+
+    /// Local calendar day as yyyy-MM-dd. String comparison against `window.end` is the
+    /// freshness test: same date format, no timezone math to get wrong.
+    private static func isoDay(_ now: Date = Date()) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f.string(from: now)
+    }
+
+    /// A window is closed once today is past its end date; that is the refresh trigger.
+    private func windowHasClosed(now: Date = Date()) -> Bool {
+        guard let end = data.window?.end, end.count == 10 else { return false }
+        return Store.isoDay(now) > end
+    }
+
     func load() {
         if let d = try? Data(contentsOf: dataURL()),
-           let b = try? JSONDecoder().decode(Briefing.self, from: d) { self.data = b }
+           let b = try? JSONDecoder().decode(Briefing.self, from: d) {
+            self.data = b
+            lastDataModification = modificationDate()
+        }
     }
+
+    /// Keep the visible widget in step with the file on disk, and rebuild it the first
+    /// time we notice the window has closed. Two independent heal paths: the daily cron
+    /// rewrites the JSON, and this check rebuilds it if cron did not (Mac asleep, job
+    /// missed). Retries are throttled so a dead network cannot spin.
+    func startAutoRefresh() {
+        checkFreshness()
+        let timer = Timer(timeInterval: freshnessCheckInterval, repeats: true) { [weak self] _ in
+            self?.checkFreshness()
+        }
+        freshnessTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func checkFreshness(now: Date = Date()) {
+        if let modified = modificationDate(), modified != lastDataModification {
+            load()
+        }
+        guard !busy else { return }
+        // Due when today is past the window's end date. Falls back to the ISO-week check
+        // for a briefing written before the window field existed.
+        let due: Bool
+        if data.window?.end?.count == 10 {
+            due = windowHasClosed(now: now)
+        } else if let modified = modificationDate() {
+            due = Store.weekToken(modified) != Store.weekToken(now)
+        } else {
+            due = data.rows.isEmpty      // no file at all (fresh install): build one
+        }
+        guard due else { return }
+        if let last = lastAutoRefreshAttempt, now.timeIntervalSince(last) < autoRefreshRetryInterval { return }
+        lastAutoRefreshAttempt = now
+        refresh()
+    }
+
     func refresh() {
         guard !busy else { return }
         busy = true
@@ -260,55 +347,79 @@ struct VisualEffect: NSViewRepresentable {
 }
 struct WidgetBackdrop: View {
     let tint: Color
+    @WidgetStyle private var style
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
     var body: some View {
-        ZStack {
-            if renderMode { Color(red: 0.075, green: 0.078, blue: 0.09) }
-            else { VisualEffect(); Color.black.opacity(0.28) }
-            RadialGradient(colors: [tint.opacity(0.30), tint.opacity(0.04), .clear],
-                           center: .init(x: 0.9, y: 0.0), startRadius: 6, endRadius: 360)
-            LinearGradient(colors: [Color.white.opacity(0.05), .clear, Color.black.opacity(0.18)],
-                           startPoint: .top, endPoint: .bottom)
+        if style.isThermocline {
+            if renderMode || reduceTransparency { style.surface }
+            else {
+                // A single material layer with a stable, untinted field behind the text.
+                style.canvas.overlay(.regularMaterial).overlay(style.canvas.opacity(0.72))
+            }
+        } else {
+            ZStack {
+                if renderMode || reduceTransparency {
+                    style.isDark ? Color(red: 0.075, green: 0.078, blue: 0.09) : Color(white: 0.93)
+                } else { VisualEffect(); style.isDark ? Color.black.opacity(0.28) : Color.white.opacity(0.72) }
+                RadialGradient(colors: [tint.opacity(0.30), tint.opacity(0.04), .clear],
+                               center: .init(x: 0.9, y: 0.0), startRadius: 6, endRadius: 360)
+                LinearGradient(colors: [Color.white.opacity(0.05), .clear, Color.black.opacity(style.isDark ? 0.18 : 0.04)],
+                               startPoint: .top, endPoint: .bottom)
+            }
         }
     }
 }
 
 // MARK: - Free-copy tag
 @ViewBuilder
-func ftTag(_ r: Row, library: String) -> some View {
+func ftTag(_ r: Row, library: String, style: WidgetPalette) -> some View {
+    let badge = style.label(7.5, .bold, size: 9)
     if (r.ft_host ?? "").lowercased().contains("sci-hub") {
         // honest label: this text came from Sci-Hub, not from a legitimate OA source
         HStack(spacing: 2) {
             Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 6.5, weight: .bold))
-            Text("SCI-HUB").font(.system(size: 7.5, weight: .bold)).tracking(0.5)
-        }.foregroundStyle(sciOrange)
+            Text("SCI-HUB").font(badge).tracking(0.5)
+        }.foregroundStyle(style.isThermocline ? style.muted : style.classicInk(sciOrange))
     } else if let b = r.ftBadge {
         HStack(spacing: 2) {
             Image(systemName: "arrow.down.doc.fill").font(.system(size: 7, weight: .bold))
-            Text(b).font(.system(size: 7.5, weight: .bold)).tracking(0.5)
-        }.foregroundStyle(freeGreen)
+            Text(b).font(badge).tracking(0.5)
+        }.foregroundStyle(style.isThermocline ? style.muted : style.classicInk(freeGreen))
     } else if r.oa == true {
-        Text("OPEN").font(.system(size: 7.5, weight: .bold)).tracking(0.5).foregroundStyle(freeGreen)
+        Text("OPEN").font(badge).tracking(0.5).foregroundStyle(style.isThermocline ? style.muted : style.classicInk(freeGreen))
     } else {
         HStack(spacing: 2) {
             Image(systemName: "lock.open.fill").font(.system(size: 7, weight: .bold))
-            Text("via \(library)").font(.system(size: 7.5, weight: .bold)).tracking(0.4)
-        }.foregroundStyle(libBlue)
+            Text("via \(library)").font(badge).tracking(0.4)
+        }.foregroundStyle(style.isThermocline ? style.muted : style.classicInk(libBlue))
     }
 }
 
 // MARK: - Three-axis meters + tickers
 struct Meter: View {
     let letter: String; let value: Int; let color: Color
+    @WidgetStyle private var style
     var body: some View {
         HStack(spacing: 3) {
-            Text(letter).font(.system(size: 8, weight: .heavy)).foregroundStyle(color).fixedSize()
-            ZStack(alignment: .leading) {
-                Capsule().fill(Color.white.opacity(0.09)).frame(width: 22, height: 3)
-                Capsule().fill(color).frame(width: max(2, 22 * CGFloat(value) / 100.0), height: 3)
+            Text(letter).font(style.label(8, .heavy, size: 9))
+                .foregroundStyle(style.isThermocline ? style.ink : style.classicInk(color)).fixedSize()
+            if style.isThermocline {
+                FinchBars(progress: Double(value) / 100, height: 4)
+                    .frame(width: 20).accessibilityHidden(true)
+            } else {
+                ZStack(alignment: .leading) {
+                    Capsule().fill(style.chrome.opacity(0.09)).frame(width: 22, height: 3)
+                    Capsule().fill(style.classicInk(color)).frame(width: max(2, 22 * CGFloat(value) / 100.0), height: 3)
+                }
             }
-            Text("\(value)").font(.system(size: 8, weight: .semibold, design: .rounded))
-                .foregroundStyle(.secondary).fixedSize()
-        }.fixedSize()
+            Text("\(value)").font(style.data(8, .semibold, size: 9))
+                .foregroundStyle(style.secondary).fixedSize()
+        }
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(letter == "M" ? "Market impact" : (letter == "F" ? "Field impact" : "Your appeal"))
+        .accessibilityValue("\(value) out of 100")
     }
 }
 struct TripleMeter: View {
@@ -323,31 +434,33 @@ struct TripleMeter: View {
 }
 struct Tickers: View {
     let tickers: [String]
+    @WidgetStyle private var style
     var body: some View {
         HStack(spacing: 3) {
             ForEach(tickers.prefix(2), id: \.self) { t in
-                Text(t).font(.system(size: 7.5, weight: .bold, design: .rounded)).tracking(0.2)
+                Text(t).font(style.data(7.5, .bold, size: 9)).tracking(0.2)
                     .fixedSize()
                     .padding(.horizontal, 4).padding(.vertical, 1.5)
-                    .background(Capsule().fill(marketColor.opacity(0.16)))
-                    .foregroundStyle(marketColor)
+                    .background(Capsule().fill((style.isThermocline ? style.ink : marketColor).opacity(0.16)))
+                    .foregroundStyle(style.isThermocline ? style.ink : style.classicInk(marketColor))
             }
         }
     }
 }
 struct AskPill: View {
     let action: () -> Void
+    @WidgetStyle private var style
     var body: some View {
         Button(action: action) {
             HStack(spacing: 3) {
                 Image(systemName: "sparkles").font(.system(size: 7.5, weight: .bold))
-                Text("ASK").font(.system(size: 8, weight: .heavy)).tracking(0.5)
+                Text("ASK").font(style.label(8, .heavy, size: 9)).tracking(0.5)
             }
-            .foregroundStyle(Color(red: 0.82, green: 0.82, blue: 0.97))
+            .foregroundStyle(style.isThermocline ? style.ink : style.classicInk(Color(red: 0.82, green: 0.82, blue: 0.97)))
             .fixedSize()
             .padding(.horizontal, 6).padding(.vertical, 2.5)
-            .background(Capsule().fill(Color.white.opacity(0.12)))
-        }.buttonStyle(.plain).fixedSize().help("Ask AI about this paper")
+            .background(Capsule().fill(style.chrome.opacity(0.12)))
+        }.buttonStyle(.plain).fixedSize().help("Ask AI about this paper").accessibilityLabel("Ask AI about this paper")
     }
 }
 
@@ -355,27 +468,28 @@ struct AskPill: View {
 struct HeroCard: View {
     @ObservedObject var store: Store
     let item: Row
+    @WidgetStyle private var style
     var body: some View {
-        let tint = fieldColor(item.displayField)
+        let tint = style.field(item.displayField)
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Text("TOP PICK").font(.system(size: 8.5, weight: .heavy)).tracking(1.1).foregroundStyle(tint)
-                Text(item.displayField.uppercased()).font(.system(size: 8.5, weight: .semibold)).tracking(0.6).foregroundStyle(.secondary)
+                Text("TOP PICK").font(style.label(8.5, .heavy)).tracking(1.1).foregroundStyle(tint)
+                Text(item.displayField.uppercased()).font(style.label(8.5, .semibold)).tracking(0.6).foregroundStyle(style.secondary)
                 Spacer(minLength: 0)
                 if let c = item.composite { Text(String(format: "%.0f", c))
-                    .font(.system(size: 11, weight: .heavy, design: .rounded)).foregroundStyle(tint) }
+                    .font(style.data(11, .heavy, size: 12)).foregroundStyle(tint) }
             }
-            Text(item.title ?? "").font(.system(size: 13.5, weight: .semibold)).foregroundStyle(.primary)
+            Text(item.title ?? "").font(style.ui(13.5, .semibold, size: 16)).foregroundStyle(style.primary)
                 .lineLimit(3).fixedSize(horizontal: false, vertical: true)
             if let s = item.summary, !s.isEmpty {
-                Text(s).font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(s).font(style.ui(10, size: 12)).foregroundStyle(style.secondary)
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)
             }
             HStack(spacing: 6) {
-                Text(item.journal ?? "").font(.system(size: 9.5, weight: .semibold)).foregroundStyle(tint).lineLimit(1)
-                Text(prettyDate(item.date ?? "")).font(.system(size: 9)).foregroundStyle(.tertiary)
+                Text(item.journal ?? "").font(style.ui(9.5, .semibold, size: 11)).foregroundStyle(style.isThermocline ? style.ink : tint).lineLimit(1)
+                Text(prettyDate(item.date ?? "")).font(style.ui(9, size: 11)).foregroundStyle(style.tertiary)
                 Spacer(minLength: 0)
-                ftTag(item, library: store.library)
+                ftTag(item, library: store.library, style: style)
             }
             HStack(spacing: 8) {
                 TripleMeter(m: item.m_score ?? 0, f: item.f_score ?? 0, p: item.p_score ?? 0)
@@ -384,12 +498,17 @@ struct HeroCard: View {
                 AskPill(action: { store.openChat(item) })
             }
         }
-        .padding(11)
-        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .fill(LinearGradient(colors: [tint.opacity(0.16), tint.opacity(0.04)], startPoint: .topLeading, endPoint: .bottomTrailing)))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(tint.opacity(0.28), lineWidth: 0.8))
-        .contentShape(Rectangle())
-        .onTapGesture { store.openArticle(item) }
+        .padding(style.isThermocline ? 12 : 11)
+        .background {
+            let shape = RoundedRectangle(cornerRadius: style.isThermocline ? Thermocline.Radius.md : 14, style: .continuous)
+            if style.isThermocline {
+                shape.fill(style.raised).overlay(shape.strokeBorder(tint.opacity(0.48), lineWidth: 1))
+            } else {
+                shape.fill(LinearGradient(colors: [tint.opacity(0.16), tint.opacity(0.04)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .overlay(shape.strokeBorder(tint.opacity(0.28), lineWidth: 0.8))
+            }
+        }
+        .widgetOpenAction(label: "Open full text") { store.openArticle(item) }
     }
 }
 
@@ -398,26 +517,27 @@ struct PaperRow: View {
     @ObservedObject var store: Store
     let number: Int
     let item: Row
+    @WidgetStyle private var style
     var body: some View {
-        let tint = fieldColor(item.displayField)
+        let tint = style.field(item.displayField)
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: 8) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 5, style: .continuous).fill(tint.opacity(0.16)).frame(width: 18, height: 18)
-                    Text("\(number)").font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundStyle(tint)
+                    RoundedRectangle(cornerRadius: 5, style: .continuous).fill((style.isThermocline ? style.ink : tint).opacity(0.16)).frame(width: 18, height: 18)
+                    Text("\(number)").font(style.data(9.5, .bold)).foregroundStyle(style.isThermocline ? style.ink : tint)
                 }
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(item.title ?? "").font(.system(size: 11, weight: .medium)).foregroundStyle(.primary)
+                    Text(item.title ?? "").font(style.ui(11, .medium, size: 13)).foregroundStyle(style.primary)
                         .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                     if let s = item.summary, !s.isEmpty {
-                        Text(s).font(.system(size: 9)).foregroundStyle(.secondary.opacity(0.85))
+                        Text(s).font(style.ui(9, size: 11)).foregroundStyle(style.isThermocline ? style.secondary : AnyShapeStyle(.secondary.opacity(0.85)))
                             .lineLimit(1)
                     }
                     HStack(spacing: 4) {
-                        Text(item.journal ?? "").foregroundStyle(tint).lineLimit(1)
-                        Text("·").foregroundStyle(.tertiary); Text(item.displayField)
-                        Text("·").foregroundStyle(.tertiary); ftTag(item, library: store.library)
-                    }.font(.system(size: 8.5, weight: .medium)).foregroundStyle(.secondary).lineLimit(1)
+                        Text(item.journal ?? "").foregroundStyle(style.isThermocline ? style.ink : tint).lineLimit(1)
+                        Text("·").foregroundStyle(style.tertiary); Text(item.displayField)
+                        Text("·").foregroundStyle(style.tertiary); ftTag(item, library: store.library, style: style)
+                    }.font(style.ui(8.5, .medium, size: 10)).foregroundStyle(style.secondary).lineLimit(1)
                     HStack(spacing: 8) {
                         TripleMeter(m: item.m_score ?? 0, f: item.f_score ?? 0, p: item.p_score ?? 0)
                         Spacer(minLength: 0)
@@ -428,34 +548,37 @@ struct PaperRow: View {
                 Spacer(minLength: 0)
             }
             .padding(.vertical, 7).padding(.horizontal, 3)
-            .contentShape(Rectangle()).onTapGesture { store.openArticle(item) }
-            Rectangle().fill(Color.white.opacity(0.055)).frame(height: 1).padding(.leading, 28)
+            .widgetOpenAction(label: "Open full text") { store.openArticle(item) }
+            Rectangle().fill(style.chrome.opacity(style.isThermocline ? 0.10 : 0.055)).frame(height: 1).padding(.leading, 28)
         }
     }
 }
 struct HeadlineRow: View {
     let item: Row
+    @WidgetStyle private var style
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: 9) {
-                Image(systemName: "newspaper.fill").font(.system(size: 8)).foregroundStyle(.tertiary)
+                Image(systemName: "newspaper.fill").font(.system(size: 8)).foregroundStyle(style.tertiary)
                     .frame(width: 18, height: 16, alignment: .center)
-                Text(item.title ?? "").font(.system(size: 10.5)).foregroundStyle(.primary.opacity(0.9))
+                Text(item.title ?? "").font(style.ui(10.5, size: 12)).foregroundStyle(style.isThermocline ? style.primary : AnyShapeStyle(.primary.opacity(0.9)))
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
             }
             .padding(.vertical, 6).padding(.horizontal, 3)
-            .contentShape(Rectangle()).onTapGesture { openURLString(item.url ?? "") }
-            Rectangle().fill(Color.white.opacity(0.055)).frame(height: 1).padding(.leading, 28)
+            .widgetOpenAction(label: "Open headline") { openURLString(item.url ?? "") }
+            Rectangle().fill(style.chrome.opacity(style.isThermocline ? 0.10 : 0.055)).frame(height: 1).padding(.leading, 28)
         }
     }
 }
 struct SectionLabel: View {
     let text: String
+    @WidgetStyle private var style
     var body: some View {
         HStack(spacing: 6) {
-            Text(text.uppercased()).font(.system(size: 8.5, weight: .heavy)).tracking(1.0).foregroundStyle(.secondary)
-            Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+            Text(text.uppercased()).font(style.label(8.5, .heavy)).tracking(1.0).foregroundStyle(style.secondary)
+            if style.isThermocline { LateralLine() }
+            else { Rectangle().fill(style.chrome.opacity(0.08)).frame(height: 1) }
         }.padding(.top, 10).padding(.bottom, 3).padding(.horizontal, 2)
     }
 }
@@ -481,44 +604,56 @@ func buildEntries(_ rows: [Row], heroIndex: Int?) -> [Entry] {
 // MARK: - Content
 struct ContentView: View {
     @ObservedObject var store: Store
+    @WidgetStyle private var style
     private var heroIndex: Int? { store.data.rows.firstIndex { $0.type == "paper" } }
     private var hero: Row? { heroIndex.map { store.data.rows[$0] } }
     private var entries: [Entry] {
-        let e = buildEntries(store.data.rows, heroIndex: heroIndex)
-        return renderMode ? Array(e.prefix(3)) : e
+        let entries = buildEntries(store.data.rows, heroIndex: heroIndex)
+        guard style.isThermocline else { return entries }
+        // The hero already names its field; don't leave its otherwise-empty section behind.
+        return entries.enumerated().compactMap { index, entry in
+            if entry.kind == "section" && (index == entries.count - 1 || entries[index + 1].kind == "section") {
+                return nil
+            }
+            return entry
+        }
     }
-    private var tint: Color { fieldColor(hero?.displayField ?? "stem") }
+    private var tint: Color { style.field(hero?.displayField ?? "stem") }
 
     var body: some View {
+        let panel = RoundedRectangle(cornerRadius: style.isThermocline ? Thermocline.Radius.lg : 22, style: .continuous)
         ZStack {
-        VStack(alignment: .leading, spacing: 0) {
-            grabber
-            header
-            if let h = hero { HeroCard(store: store, item: h).padding(.top, 8) }
-            Group {
-                if renderMode { rows } else { ScrollView(.vertical, showsIndicators: false) { rows } }
-            }.padding(.top, 4).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            footer
-        }
-        .padding(.horizontal, 14).padding(.top, 7).padding(.bottom, 10)
-        .frame(width: WIDGET_W, height: WIDGET_H)
-        .background(WidgetBackdrop(tint: tint))
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
-            .strokeBorder(LinearGradient(colors: [Color.white.opacity(0.16), Color.white.opacity(0.04)],
-                                         startPoint: .top, endPoint: .bottom), lineWidth: 0.8))
-            if store.chatArticle != nil {
-                ChatView(store: store)
-                    .transition(.opacity)
+            VStack(alignment: .leading, spacing: 0) {
+                grabber
+                header
+                if let h = hero { HeroCard(store: store, item: h).padding(.top, 8) }
+                Group {
+                    if renderMode {
+                        // ImageRenderer can't draw ScrollView. Keep the same bounded viewport.
+                        GeometryReader { proxy in rows.frame(width: proxy.size.width, alignment: .topLeading) }
+                            .clipped()
+                    } else { ScrollView(.vertical, showsIndicators: false) { rows } }
+                }
+                .padding(.top, 4)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                footer
             }
+            .padding(.horizontal, 14).padding(.top, 7).padding(.bottom, 10)
+            .frame(minWidth: MIN_W, maxWidth: .infinity, minHeight: MIN_H, maxHeight: .infinity)
+            .background(WidgetBackdrop(tint: tint))
+            .clipShape(panel)
+            .overlay(panel.strokeBorder(LinearGradient(
+                colors: [style.chrome.opacity(0.16), style.chrome.opacity(style.isThermocline ? 0.12 : 0.04)],
+                startPoint: .top, endPoint: .bottom), lineWidth: style.isThermocline ? 1 : 0.8))
+            if store.chatArticle != nil { ChatView(store: store).transition(.opacity) }
         }
     }
 
     // top-center grab handle — a real window-drag strip, not just decoration
     private var grabber: some View {
         ZStack {
-            Color.white.opacity(0.001)                       // fill the strip so it's all grabbable
-            Capsule().fill(Color.white.opacity(0.28)).frame(width: 42, height: 5)
+            style.chrome.opacity(0.001)                      // fill the strip so it's all grabbable
+            Capsule().fill(style.chrome.opacity(0.28)).frame(width: 42, height: 5)
         }
         .frame(maxWidth: .infinity).frame(height: 14)
         .contentShape(Rectangle())
@@ -530,14 +665,18 @@ struct ContentView: View {
     private var header: some View {
         HStack(alignment: .center, spacing: 7) {
             HStack(alignment: .center, spacing: 7) {
-                ZStack {
-                    Circle().fill(Color.white.opacity(0.09)).frame(width: 20, height: 20)
-                    Image(systemName: "sparkles").font(.system(size: 10, weight: .semibold)).foregroundStyle(.primary)
+                if style.isThermocline {
+                    HorizonEyeMark(monochrome: true).frame(width: 30, height: 18).accessibilityHidden(true)
+                } else {
+                    ZStack {
+                        Circle().fill(style.chrome.opacity(0.09)).frame(width: 20, height: 20)
+                        Image(systemName: "sparkles").font(.system(size: 10, weight: .semibold)).foregroundStyle(.primary)
+                    }
                 }
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("WEEKLY STEM BRIEFING").font(.system(size: 8.5, weight: .heavy)).tracking(1.2).foregroundStyle(.secondary)
+                    Text("WEEKLY STEM BRIEFING").font(style.label(8.5, .heavy, size: 11)).tracking(1.2).foregroundStyle(style.secondary)
                     Text(store.data.subtitle.replacingOccurrences(of: "Week of ", with: ""))
-                        .font(.system(size: 12, weight: .semibold, design: .rounded)).foregroundStyle(.primary).lineLimit(1)
+                        .font(style.data(12, .semibold, size: 13)).foregroundStyle(style.primary).lineLimit(1)
                 }
                 Spacer(minLength: 0)
             }
@@ -545,9 +684,9 @@ struct ContentView: View {
             .overlay(renderMode ? nil : AnyView(DragHandle()))    // whole bar drags, except the button
             Button(action: { store.refresh() }) {
                 Image(systemName: "arrow.clockwise").font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(store.busy ? Color.secondary : Color.primary.opacity(0.75))
-                    .frame(width: 24, height: 24).background(Circle().fill(Color.white.opacity(0.08)))
-            }.buttonStyle(.plain).help("Rebuild from live sources")
+                    .foregroundStyle(store.busy ? style.muted : (style.isThermocline ? style.lead : Color.primary.opacity(0.75)))
+                    .frame(width: 24, height: 24).background(Circle().fill(style.chrome.opacity(0.08)))
+            }.buttonStyle(.plain).disabled(store.busy).help("Rebuild from live sources").accessibilityLabel("Refresh briefing")
         }
     }
 
@@ -566,13 +705,17 @@ struct ContentView: View {
     private var footer: some View {
         HStack(spacing: 6) {
             // axis legend
-            HStack(spacing: 3) { Circle().fill(marketColor).frame(width: 5, height: 5); Text("Market").foregroundStyle(.tertiary) }
-            HStack(spacing: 3) { Circle().fill(impactColor).frame(width: 5, height: 5); Text("Field").foregroundStyle(.tertiary) }
-            HStack(spacing: 3) { Circle().fill(youColor).frame(width: 5, height: 5); Text("You").foregroundStyle(.tertiary) }
+            if style.isThermocline {
+                Text("M Market · F Field · Y You").foregroundStyle(style.tertiary)
+            } else {
+                HStack(spacing: 3) { Circle().fill(style.classicInk(marketColor)).frame(width: 5, height: 5); Text("Market").foregroundStyle(.tertiary) }
+                HStack(spacing: 3) { Circle().fill(style.classicInk(impactColor)).frame(width: 5, height: 5); Text("Field").foregroundStyle(.tertiary) }
+                HStack(spacing: 3) { Circle().fill(style.classicInk(youColor)).frame(width: 5, height: 5); Text("You").foregroundStyle(.tertiary) }
+            }
             Spacer()
             Text(store.data.generated.isEmpty ? "—" : "synced \(store.data.generated)")
-                .foregroundStyle(.tertiary)
-        }.font(.system(size: 8, weight: .medium)).padding(.top, 6)
+                .foregroundStyle(style.tertiary).lineLimit(1)
+        }.font(style.label(8, size: 9)).padding(.top, 6)
     }
 }
 
@@ -580,16 +723,17 @@ struct ContentView: View {
 struct ChatBubble: View {
     let msg: ChatMsg
     let tint: Color
+    @WidgetStyle private var style
     var body: some View {
         HStack {
             if msg.role == "user" { Spacer(minLength: 26) }
             Text(msg.text)
-                .font(.system(size: 11))
+                .font(style.ui(11, size: 13))
                 .textSelection(.enabled)
-                .foregroundStyle(msg.role == "user" ? Color.black.opacity(0.85) : Color.primary)
+                .foregroundStyle(msg.role != "user" ? style.ink : (style.isThermocline ? style.onLead : Color.black.opacity(0.85)))
                 .padding(.horizontal, 10).padding(.vertical, 7)
                 .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(msg.role == "user" ? tint.opacity(0.85) : Color.white.opacity(0.08)))
+                    .fill(msg.role == "user" ? tint.opacity(style.isThermocline ? 1 : (style.isDark ? 0.85 : 0.20)) : style.chrome.opacity(0.08)))
                 .fixedSize(horizontal: false, vertical: true)
             if msg.role == "ai" { Spacer(minLength: 26) }
         }
@@ -598,6 +742,9 @@ struct ChatBubble: View {
 
 struct ChatView: View {
     @ObservedObject var store: Store
+    @WidgetStyle private var style
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     private var art: Row? { store.chatArticle }
     private var canSend: Bool {
         !store.chatDraft.trimmingCharacters(in: .whitespaces).isEmpty && !store.chatBusy
@@ -614,11 +761,11 @@ struct ChatView: View {
         VStack(alignment: .leading, spacing: 8) {
             if store.chatMessages.isEmpty && !store.chatBusy {
                 Text("Ask anything about this paper — what it found, why it matters, the methods, the caveats, or how it ties to your work.")
-                    .font(.system(size: 10.5)).foregroundStyle(.secondary).padding(.top, 10)
+                    .font(style.ui(10.5, size: 12)).foregroundStyle(style.secondary).padding(.top, 10)
                 VStack(alignment: .leading, spacing: 5) {
                     ForEach(starters, id: \.self) { s in
                         Button(action: { store.ask(s) }) {
-                            Text(s).font(.system(size: 10, weight: .medium)).foregroundStyle(tint)
+                            Text(s).font(style.ui(10, .medium, size: 12)).foregroundStyle(tint)
                                 .padding(.horizontal, 9).padding(.vertical, 5)
                                 .background(Capsule().fill(tint.opacity(0.14)))
                         }.buttonStyle(.plain)
@@ -629,49 +776,52 @@ struct ChatView: View {
             if store.chatBusy {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
-                    Text("thinking…").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("thinking…").font(style.ui(10, size: 12)).foregroundStyle(style.secondary)
                 }
             }
         }.padding(.vertical, 10).frame(maxWidth: .infinity, alignment: .leading)
     }
 
     var body: some View {
-        let tint = fieldColor(art?.displayField ?? "stem")
+        let tint = style.field(art?.displayField ?? "stem")
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 Button(action: { store.closeChat() }) {
                     Image(systemName: "chevron.left").font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(.primary.opacity(0.8))
-                        .frame(width: 26, height: 26).background(Circle().fill(Color.white.opacity(0.1)))
+                        .foregroundStyle(style.ink.opacity(0.8))
+                        .frame(width: 26, height: 26).background(Circle().fill(style.chrome.opacity(0.1)))
                 }.buttonStyle(.plain).help("Back to briefing")
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("ASK ABOUT THIS PAPER").font(.system(size: 8, weight: .heavy)).tracking(1.1).foregroundStyle(tint)
-                    Text(art?.title ?? "").font(.system(size: 11, weight: .semibold)).foregroundStyle(.primary)
+                    Text("ASK ABOUT THIS PAPER").font(style.label(8, .heavy)).tracking(1.1).foregroundStyle(tint)
+                    Text(art?.title ?? "").font(style.ui(11, .semibold, size: 13)).foregroundStyle(style.primary)
                         .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
             }
             .padding(.bottom, 8)
-            Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+            Rectangle().fill(style.chrome.opacity(0.08)).frame(height: 1)
 
             if renderMode {
                 transcript(tint).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: false) { transcript(tint) }
-                        .onChange(of: store.chatMessages.count) { _ in
+                        .onChange(of: store.chatMessages.count) {
                             if let last = store.chatMessages.last?.id {
-                                withAnimation { proxy.scrollTo(last, anchor: .bottom) }
+                                withAnimation(reduceMotion ? nil : Thermocline.Motion.standard) { proxy.scrollTo(last, anchor: .bottom) }
                             }
                         }
                 }.frame(maxHeight: .infinity)
             }
 
             HStack(spacing: 7) {
-                TextField("Ask about this paper…", text: $store.chatDraft, onCommit: send)
-                    .textFieldStyle(.plain).font(.system(size: 11))
+                Group {
+                    if renderMode { Text("Ask about this paper…").foregroundStyle(style.secondary) }
+                    else { TextField("Ask about this paper…", text: $store.chatDraft, onCommit: send).textFieldStyle(.plain) }
+                }
+                    .font(style.ui(11, size: 13)).frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 10).padding(.vertical, 7)
-                    .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.09)))
+                    .background(RoundedRectangle(cornerRadius: 10).fill(style.chrome.opacity(0.09)))
                 Button(action: send) {
                     Image(systemName: "arrow.up.circle.fill").font(.system(size: 21))
                         .foregroundStyle(canSend ? tint : Color.secondary.opacity(0.5))
@@ -679,14 +829,16 @@ struct ChatView: View {
             }
         }
         .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 12)
-        .frame(width: WIDGET_W, height: WIDGET_H)
+        .frame(minWidth: MIN_W, maxWidth: .infinity, minHeight: MIN_H, maxHeight: .infinity)
         .background(
             ZStack {
-                if renderMode { Color(red: 0.07, green: 0.072, blue: 0.085) }
-                else { VisualEffect(); Color.black.opacity(0.45) }
+                if style.isThermocline { style.surface } // The chat covers the widget; don't stack two materials.
+                else if renderMode || reduceTransparency {
+                    style.isDark ? Color(red: 0.07, green: 0.072, blue: 0.085) : Color(white: 0.93)
+                } else { VisualEffect(); style.isDark ? Color.black.opacity(0.45) : Color.white.opacity(0.80) }
             }
         )
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: style.isThermocline ? Thermocline.Radius.lg : 22, style: .continuous))
     }
 }
 
@@ -695,31 +847,21 @@ final class WidgetWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 }
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var window: WidgetWindow!
     var statusItem: NSStatusItem!
+    var toggleItem: NSMenuItem?
+    var appearanceItem: NSMenuItem?
+    private var appearanceChange: AnyCancellable?
+    private let appearance = AppearanceStore(defaults: .standard)
+    private let appearancePopover = NSPopover()
     let store = Store()
-    let modeKey = "WeeklyStemBriefingDesktopMode"
     var desktopMode: Bool {
-        get { UserDefaults.standard.bool(forKey: modeKey) }
-        set { UserDefaults.standard.set(newValue, forKey: modeKey); applyLevel() }
+        get { WidgetLayer.pinned }
+        set { WidgetLayer.pinned = newValue; applyLevel() }
     }
-    func applyLevel() {
-        if desktopMode {
-            // pinned to the desktop, behind other windows (per his standing rule)
-            window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) - 1)
-            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
-        } else {
-            // normal, freely draggable, never forced on top
-            window.level = .normal
-            window.collectionBehavior = [.canJoinAllSpaces]
-        }
-    }
+    func applyLevel() { WidgetLayer.apply(window) }
     func applicationDidFinishLaunching(_ note: Notification) {
-        NSApp.appearance = NSAppearance(named: .darkAqua)
-        // Always come up in the freely-draggable normal layer; the user can
-        // re-pin to the desktop from the menu if they want it behind windows.
-        UserDefaults.standard.set(false, forKey: modeKey)
         store.load()
 
         // headless self-test of the AI shell-out (exercises the real code path)
@@ -733,39 +875,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil); return
         }
 
-        if let i = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.arguments.count > i + 1 {
-            let out = CommandLine.arguments[i + 1]
-            if CommandLine.arguments.contains("--chat"),
-               let first = store.data.rows.first(where: { $0.type == "paper" }) {
-                store.chatArticle = first
-                store.chatMessages = [
-                    ChatMsg(role: "user", text: "Why does it matter to the field/industry?"),
-                    ChatMsg(role: "ai", text: "It refines how clinicians grade lesion difficulty before endoscopic removal, which standardizes case selection and training and nudges adoption of endoscopic resection over surgery — relevant to scope makers and surgical-robotics players. Caveat: a scoring-optimization paper, not a new device or an outcomes trial.")]
-            }
-            let r = ImageRenderer(content: ContentView(store: store).environment(\.colorScheme, .dark)
-                .frame(width: WIDGET_W, height: WIDGET_H))
-            r.scale = 2
-            if let img = r.nsImage, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
-               let png = rep.representation(using: .png, properties: [:]) {
-                try? png.write(to: URL(fileURLWithPath: out)); print("rendered \(out)")
-            }
-            NSApp.terminate(nil); return
-        }
-
-        let hosting = NSHostingView(rootView: ContentView(store: store))
-        hosting.setFrameSize(NSSize(width: WIDGET_W, height: WIDGET_H))
-        window = WidgetWindow(contentRect: NSRect(x: 0, y: 0, width: WIDGET_W, height: WIDGET_H),
+        store.startAutoRefresh()
+        let hosting = NSHostingView(rootView: StyledWidget(store: appearance, content: ContentView(store: store)))
+        let size = WidgetResize.savedSize(key: SIZE_KEY,
+                                         fallback: NSSize(width: WIDGET_W, height: WIDGET_H),
+                                         min: NSSize(width: MIN_W, height: MIN_H))
+        hosting.setFrameSize(size)
+        window = WidgetWindow(contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless, .fullSizeContentView], backing: .buffered, defer: false)
-        window.contentView = hosting
+        WidgetResize.install(window: window, hosting: hosting,
+                             minSize: NSSize(width: MIN_W, height: MIN_H),
+                             defaultSize: NSSize(width: WIDGET_W, height: WIDGET_H),
+                             key: SIZE_KEY)
         window.isOpaque = false; window.backgroundColor = .clear; window.hasShadow = true
         window.isMovableByWindowBackground = true; window.hidesOnDeactivate = false
+        window.appearance = appearance.appearance.windowAppearance
         applyLevel()
         if let scr = NSScreen.main {
             let f = scr.visibleFrame
-            window.setFrameOrigin(NSPoint(x: f.maxX - WIDGET_W - 24, y: f.maxY - WIDGET_H - 24))
+            let size = window.frame.size
+            window.setFrameOrigin(NSPoint(x: f.maxX - size.width - 24, y: f.maxY - size.height - 24))
         }
         window.orderFront(nil)
+        WidgetPin.install(window: window) { [weak self] in
+            self?.homeOrigin() ?? NSPoint(x: 40, y: 40)
+        }
+        WidgetBus.observe { [weak self] command in
+            guard let self else { return }
+            switch command {
+            case .hideAll:
+                self.window.orderOut(nil)
+            case .showAll:
+                let size = self.window.frame.size
+                self.window.setFrameOrigin(self.homeOrigin())
+                _ = size
+                self.applyLevel()
+                self.window.orderFront(nil)
+            }
+        }
         makeStatusItem()
+        appearancePopover.behavior = .transient
+        appearancePopover.animates = false
+        appearancePopover.contentViewController = NSHostingController(rootView: StyledWidget(
+            store: appearance, content: AppearancePicker(store: appearance)
+                .fixedSize(horizontal: false, vertical: true).frame(width: AppearancePicker.popoverWidth)))
+        appearanceChange = appearance.$appearance.sink { [weak self] value in
+            self?.window.appearance = value.windowAppearance
+            self?.appearancePopover.appearance = value.windowAppearance
+            self?.appearanceItem?.title = Self.appearanceMenuTitle(value)
+        }
+
+        if CommandLine.arguments.contains("--toggle-test") { runToggleTestIfAsked() }
+        if CommandLine.arguments.contains("--pin-test") { WidgetPin.runSelfTest(window: window, home: { [weak self] in self?.homeOrigin() ?? .zero }) }
     }
 
     func makeStatusItem() {
@@ -774,15 +935,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image?.isTemplate = true
         rebuildMenu()
     }
-    func rebuildMenu() { statusItem.menu = buildMenu() }
+    func rebuildMenu() {
+        let m = buildMenu()
+        m.delegate = self
+        statusItem.menu = m
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        toggleItem?.title = window.isVisible ? "Hide Weekly Briefing" : "Show Weekly Briefing"
+    }
     func buildMenu() -> NSMenu {
         let m = NSMenu()
         func add(_ title: String, _ sel: Selector, _ key: String = "", state: NSControl.StateValue? = nil) {
             let mi = NSMenuItem(title: title, action: sel, keyEquivalent: key); mi.target = self
             if let s = state { mi.state = s }; m.addItem(mi)
         }
-        add("Show / Hide widget", #selector(toggleVisible))
+        let toggle = NSMenuItem(title: "Hide Weekly Briefing", action: #selector(toggleVisible), keyEquivalent: "")
+        toggle.target = self
+        toggleItem = toggle
+        m.addItem(toggle)
+        add("Hide all widgets", #selector(hideAllWidgets))
+        add("Show all widgets", #selector(showAllWidgets))
+        m.addItem(.separator())
         add("Pin to desktop (behind windows)", #selector(toggleDesktop), state: desktopMode ? .on : .off)
+        // global hotkeys inline, disabled rows so they read as reference
+        let keysItem = NSMenuItem(title: "Widget hotkeys", action: nil, keyEquivalent: "")
+        let keysMenu = NSMenu()
+        for (name, key) in [("Volume Mixer", "m"), ("Holding Shelf", "s")] {
+            let row = NSMenuItem(title: name, action: nil, keyEquivalent: key)
+            row.keyEquivalentModifierMask = [.shift, .command]
+            row.isEnabled = false
+            keysMenu.addItem(row)
+        }
+        keysMenu.addItem(.separator())
+        let mapItem = NSMenuItem(title: "Full key map\u{2026}", action: #selector(openKeyMap), keyEquivalent: "")
+        mapItem.target = self
+        keysMenu.addItem(mapItem)
+        keysItem.submenu = keysMenu
+        m.addItem(keysItem)
         // which university proxy unlocks paywalled papers
         let libItem = NSMenuItem(title: "Library for paywalled papers", action: nil, keyEquivalent: "")
         let lib = NSMenu()
@@ -793,14 +983,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lib.addItem(it)
         }
         libItem.submenu = lib; m.addItem(libItem)
+        let appearanceItem = NSMenuItem(title: Self.appearanceMenuTitle(appearance.appearance),
+                                        action: #selector(showAppearance), keyEquivalent: ",")
+        appearanceItem.target = self
+        self.appearanceItem = appearanceItem
+        m.addItem(appearanceItem)
         m.addItem(.separator())
         add("Refresh now", #selector(refreshNow), "r")
+        add("Reset size", #selector(resetSize))
         add("Move: top-right", #selector(moveTR))
         add("Move: center", #selector(moveCenter))
         add("Open data folder", #selector(openData))
         m.addItem(.separator())
         add("Quit", #selector(quitApp), "q")
         return m
+    }
+    private static func appearanceMenuTitle(_ value: WidgetAppearance) -> String {
+        "Appearance…   \(value.summary)"
+    }
+    @objc func showAppearance() {
+        guard let button = statusItem.button else { return }
+        if appearancePopover.isShown { appearancePopover.performClose(nil); return }
+        DispatchQueue.main.async { [weak self, weak button] in
+            guard let self, let button else { return }
+            self.appearancePopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
     }
     @objc func pickLibrary(_ sender: NSMenuItem) {
         if let name = sender.representedObject as? String { store.setLibrary(name); rebuildMenu() }
@@ -813,22 +1020,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         desktopMode.toggle(); rebuildMenu(); window.orderFront(nil)
     }
     @objc func refreshNow() { store.refresh() }
+
+    /// The full widget key map, kept in one file rather than duplicated per app.
+    @objc func openKeyMap() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory() + "/WIDGETS.md"))
+    }
+
+    func runToggleTestIfAsked() {
+        guard CommandLine.arguments.contains("--toggle-test") else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            let before = self.window.isVisible
+            self.toggleVisible()
+            let hidden = self.window.isVisible
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                self.toggleVisible()
+                let back = self.window.isVisible
+                print("toggle-test: visible=\(before) afterHide=\(hidden) afterShow=\(back)")
+                print(!hidden && back ? "PASS" : "FAIL")
+                exit(!hidden && back ? 0 : 1)
+            }
+        }
+    }
     @objc func openData() {
         NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/WeeklyStemBriefing"))
     }
+    /// Home slot: top-right, 24pt in. Movable while working, pinned here on lock.
+    private func homeOrigin() -> NSPoint {
+        guard let vf = NSScreen.main?.visibleFrame else { return window.frame.origin }
+        let size = window.frame.size
+        return NSPoint(x: vf.maxX - size.width - 24, y: vf.maxY - size.height - 24)
+    }
+
     private func place(_ pick: (NSRect) -> NSPoint) {
         guard let scr = NSScreen.main else { return }
         window.setFrameOrigin(pick(scr.visibleFrame)); window.orderFront(nil)
     }
-    @objc func moveTR() { place { f in NSPoint(x: f.maxX - WIDGET_W - 24, y: f.maxY - WIDGET_H - 24) } }
-    @objc func moveCenter() { place { f in NSPoint(x: f.midX - WIDGET_W/2, y: f.midY - WIDGET_H/2) } }
+    @objc func moveTR() {
+        place { f in
+            let s = window.frame.size
+            return NSPoint(x: f.maxX - s.width - 24, y: f.maxY - s.height - 24)
+        }
+    }
+    @objc func moveCenter() {
+        place { f in
+            let s = window.frame.size
+            return NSPoint(x: f.midX - s.width/2, y: f.midY - s.height/2)
+        }
+    }
+    @objc func hideAllWidgets() { WidgetBus.post(.hideAll) }
+    @objc func showAllWidgets() { WidgetBus.post(.showAll) }
+
+    @objc func resetSize() {
+        ResizeOverlayView.resetSize(window: window,
+                                    to: NSSize(width: WIDGET_W, height: WIDGET_H),
+                                    key: SIZE_KEY)
+        window.orderFront(nil)
+    }
     @objc func quitApp() { NSApp.terminate(nil) }
 }
+
+if CommandLine.arguments.contains("--appearance-test") {
+    let passed = AppearanceStore.test()
+    print(passed ? "appearance-test: PASS" : "appearance-test: FAIL")
+    exit(passed ? 0 : 1)
+}
+if let code = MainActor.assumeIsolated({ WidgetSnapshots.runIfRequested() }) { exit(code) }
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.appearance = NSAppearance(named: .darkAqua)
 app.setActivationPolicy(.accessory)
 app.run()

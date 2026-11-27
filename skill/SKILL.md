@@ -15,18 +15,49 @@ metadata:
 
 A field-balanced, triple-ranked weekly digest of peer-reviewed science, with a free
 full-text link (or sci-hub fallback) for every paper. Feeds a native macOS widget and a
-Monday-morning text.
+morning text on the day each week rolls over.
 
 ## Generator
 
 ```bash
-python3 ~/.hermes/profiles/research/tools/weekly_stem_briefing.py            # last 7 days
+python3 ~/.hermes/profiles/research/tools/weekly_stem_briefing.py            # build the next window
+python3 ~/.hermes/profiles/research/tools/weekly_stem_briefing.py --status   # window state, no network
 python3 ~/.hermes/profiles/research/tools/weekly_stem_briefing.py --dry-run  # print table, no write
 python3 ~/.hermes/profiles/research/tools/weekly_stem_briefing.py --no-fulltext  # fast, no links
 ```
 
 Flags: `--days 7`, `--top 14` (papers kept after balancing), `--headlines 4` (per feed),
-`--pages 2` (OpenAlex pages x200 to scan), `--end YYYY-MM-DD`.
+`--pages 2` (OpenAlex pages x200 to scan), `--end YYYY-MM-DD` (pin the window),
+`--max-age-days 182`, `--force` (rebuild an open window), `--status`.
+
+**The window chains, and that is the whole refresh mechanism.** A run reads `window.end`
+from the briefing already on disk. While today is still on or before that date the window
+is open and the generator prints `WINDOW OPEN ... nothing to do` and exits 0 without
+touching anything. The first run on the day after `end` builds `end -> end + days`, so
+consecutive briefings tile the calendar, the header rolls forward by itself, and nothing
+overlaps except the single boundary day that is both the old end and the new start.
+Catch-up after missed runs is lossless: the earliest outstanding window is built first,
+then the next one on the following run. `--end` pins a window and skips the chain;
+`--force` rebuilds the open window in place; `--dry-run` is allowed through an open window
+because it writes nothing.
+
+```
+window 2026-11-05..2026-11-12 (chained from the previous window)
+WINDOW OPEN: 2026-11-05..2026-11-12 is still current (6 day(s) left, closes end of 2026-11-12). Next refresh 2026-11-13: nothing to do.
+```
+
+`test_window_chain.py` proves the chain without a network (run it after any edit); it
+covers first run, open window, the roll, the second roll, multi-week catch-up, `--force`,
+`--dry-run`, and a pinned `--end`.
+
+
+**Window floor (hard).** Nothing older than `MAX_AGE_DAYS` (182, ~6 months) before `--end`
+is ever queried or kept. `--days` is clamped to it, so a big `--days` cannot reach further
+back. The floor is then re-proved on the returned records (step 1b): any paper whose
+`publication_date` falls outside `[end - max_age, end]` is dropped before it can take a slot,
+because OpenAlex will happily date a work to its issue/reindex date. The floor and the
+effective window are written into `briefing.json` under `window` (`start`, `end`, `days`,
+`floor`, `max_age_days`) and into the notes header.
 
 ## How it works (v3 — the de-skew rewrite)
 
@@ -99,7 +130,7 @@ paper with no Sci-Hub copy shows `via SJSU/BU`.
 ## Widget
 
 Native SwiftUI/AppKit panel (no Xcode): `~/WeeklyStemBriefing/` (`Sources/main.swift`,
-`build-app.sh`). **380x470** (small). Each card shows field tag, title, 1-line summary, the
+`build-app.sh`). **420 × 420** by default; previously saved sizes are preserved. Each card shows field tag, title, 1-line summary, the
 three M/F/Y meters, ticker chips, and a free-text badge. Hero = top composite pick.
 
 - **Ask AI** — every card (hero + rows) has a ✨ ASK pill. It opens an in-widget chat about
@@ -109,13 +140,16 @@ three M/F/Y meters, ticker chips, and a free-text badge. Hero = top composite pi
   brief and NOT invent findings when the abstract is missing. Code: `Store.runClaude` +
   `ChatView`/`ChatBubble`. The shell-out sets HOME/USER/LOGNAME/PATH explicitly — claude needs
   USER/LOGNAME or it reports "Not logged in" under a launchd-minimal env.
-- Rebuild: `bash ~/WeeklyStemBriefing/build-app.sh`
-- Offscreen checks: `...WeeklyStemBriefing --render /tmp/wsb.png` (briefing; shows first 3
-  entries so chrome fits the frame — the live app scrolls), `--render /tmp/c.png --chat`
-  (chat view with a seeded Q&A; the TextField renders as a yellow box in ImageRenderer, an
-  artifact only), and `--ask-test` (headless end-to-end test of the Claude shell-out — prints
-  a real answer about the top paper). `swiftc` here has NO SwiftUI macro plugin, so `@State`
-  is unavailable; keep view-local mutable state on the `Store` (`@Published`) instead.
+- **Appearance**: sparkles menu → Appearance… opens live previews for Thermocline (default)
+  or Classic, System/Light/Dark, and seven Thermocline accents (Crown default). Classic + Dark
+  restores the original dark skin and field colors. Preferences persist across launches.
+- Rebuild: `bash build-app.sh` builds into the checkout's own `build/` directory. To avoid
+  replacing the live bundle, build from a worktree. Do not relaunch just to verify appearance.
+- Offscreen checks: `...WeeklyStemBriefing --render-appearance /path/to/widget.png --mode light`
+  renders a deterministic fixture; `--render-settings /path/to/settings.png` renders the picker.
+  `--render /path/to/chat.png --fixture --chat` shows a seeded Q&A. These commands open no window
+  and do not refresh or write the live briefing. `tools/test_widget_snapshots.py` runs the matrix.
+  `--ask-test` is a separate headless test that calls the real Claude CLI.
 - Relaunch: `pkill -x WeeklyStemBriefing; launchctl kickstart -k gui/$(id -u)/local.abduel.weeklystembriefing`
 - **Movable**: launches in the normal (freely draggable) layer every time — drag it anywhere
   by the background or the top grabber pill. It does NOT float above other windows. The menu-bar
@@ -125,9 +159,20 @@ three M/F/Y meters, ticker chips, and a free-text badge. Hero = top composite pi
 
 ## Cron
 
-Research profile cron "Weekly STEM briefing" (`0 6 * * 1`) runs the generator and texts the
-top 3 over BlueBubbles. Report each as: title (italic); journal · field; M/F/You + composite;
+Research profile cron "Weekly STEM briefing" (`0 6 * * *`, daily) runs the generator, which
+decides for itself whether a window has closed. On most days it reports `WINDOW OPEN` and
+the job answers `[SILENT]`; on the day after a window ends it rebuilds and reports the top 3
+over BlueBubbles. Report each as: title (italic); journal · field; M/F/You + composite;
 tickers if any; free PDF / open page / paywalled with the link when free.
+
+Daily, not Mondays: the window end date rolls through the week, so a fixed weekday cannot
+line up with it. Never let the job `--force` an open window to have something to report.
+
+Two independent heal paths, either one is enough. The cron rewrites the JSON at 6am; the
+widget itself checks every 5 minutes and rebuilds the moment `window.end` is in the past, so
+a missed or late cron (Mac asleep, ticker down) still updates the widget within minutes of
+login. The widget judges freshness by `window.end`, never by the file's mtime: two adjacent
+days share an ISO week, so a week-of-year comparison silently never fires.
 
 ## Pitfalls
 
